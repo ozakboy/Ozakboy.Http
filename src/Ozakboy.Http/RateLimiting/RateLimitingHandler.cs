@@ -66,7 +66,7 @@ public sealed class RateLimitingHandler : DelegatingHandler
         var acquisition = await _limiter.AcquireAsync(weight, cancellationToken).ConfigureAwait(false);
         if (acquisition.IsFailure)
         {
-            throw acquisition.Error!.ToException();
+            throw acquisition.Error.ToException();
         }
 
         return await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
