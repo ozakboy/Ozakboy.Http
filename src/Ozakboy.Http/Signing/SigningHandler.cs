@@ -12,16 +12,26 @@ namespace Ozakboy.Http.Signing;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>位置在重試之內、限流之外。</b>每一次嘗試都是一個新請求,必須重新簽章:時間戳要是當下的
-/// (見 <see cref="SigningOptions.TimestampParameterName"/>),否則退避一久,重試就會被對方的時間窗拒絕
-/// (幣安 <c>-1021</c>)。簽章之後的處理器(限流、日誌)都不改動請求內容,送出的字串因此與簽過的字串逐字相同。
-/// 0.2.0 把它放在最外層、重試之外,重試因此沿用第一次的簽章與時間戳 —— 當時的註解宣稱這是刻意的,推理剛好相反。
-/// <b>It sits inside retry and outside rate limiting.</b> Every attempt is a new request and has to be signed
-/// afresh with a current timestamp (see <see cref="SigningOptions.TimestampParameterName"/>); otherwise a long
-/// backoff gets the retry rejected by the peer's time window (Binance <c>-1021</c>). The handlers after it —
-/// rate limiting and logging — never alter the request, so the string sent matches the string signed byte for
-/// byte. In 0.2.0 it sat outermost, outside retry, so retries reused the first attempt's signature and
-/// timestamp; the comment of the time called that deliberate, with the reasoning exactly backwards.
+/// <b>位置在重試與限流之內、日誌之外。</b>每一次嘗試都是一個新請求,必須重新簽章;而且要在拿到限流許可<b>之後</b>才簽 ——
+/// 時間戳必須是送出那一刻的(見 <see cref="SigningOptions.TimestampParameterName"/>)。先簽再排隊,時間戳就在隊伍裡過期:
+/// 限流等待上限預設 30 秒,幣安的 recvWindow 預設只有 5 秒。簽章之後只剩日誌,不改動請求內容,
+/// 送出的字串因此與簽過的字串逐字相同。
+/// <b>It sits inside retry and rate limiting, outside logging.</b> Every attempt is a new request and has to be
+/// signed afresh — and only <b>after</b> the rate-limit permit is held, because the timestamp must be the moment
+/// the request goes out (see <see cref="SigningOptions.TimestampParameterName"/>). Sign first and queue
+/// afterwards, and the timestamp ages in the queue: the limiter waits up to 30 seconds by default, while
+/// Binance's recvWindow defaults to 5. Only logging follows, and it never alters the request, so the string sent
+/// matches the string signed byte for byte.
+/// </para>
+/// <para>
+/// 歷史:0.2.0 把它放在最外層、重試之外,重試因此沿用第一次的簽章與時間戳(當時的註解宣稱這是刻意的,推理剛好相反)。
+/// 0.3.0 開發中先改成「重試 → 簽章 → 限流」,重試是修好了,但變成先簽章再排隊,排隊超過 recvWindow 的請求一出去就被拒絕
+/// (<c>-1021</c>),所以最後定在限流之內。
+/// History: 0.2.0 put it outermost, outside retry, so retries reused the first attempt's signature and
+/// timestamp (the comment of the time called that deliberate, with the reasoning exactly backwards). A 0.3.0
+/// draft moved to "retry, signing, rate limiting", which fixed retries but signed before queueing, so a request
+/// that queued past recvWindow was rejected the moment it went out (<c>-1021</c>); hence its final place inside
+/// rate limiting.
 /// </para>
 /// <para>
 /// 未標記需要簽章、但帶有參數的請求,仍會把參數編碼進 URI。這樣公開端點與私有端點的組裝方式一致,

@@ -1,4 +1,5 @@
 using Ozakboy.Core.Abstractions;
+using Ozakboy.Http.Retry;
 
 namespace Ozakboy.Http.RateLimiting;
 
@@ -17,6 +18,23 @@ namespace Ozakboy.Http.RateLimiting;
 /// its own weight. That matches the peer's arithmetic: services such as Binance count the requests they actually
 /// receive and answer 418 — an address ban — past the limit, and when the error rate climbs, retries are very
 /// real extra weight.
+/// </para>
+/// <para>
+/// <b>位置在簽章之外。</b>拿到許可之後,簽章處理器才簽章、蓋時間戳。先簽再排隊,時間戳就在隊伍裡過期:
+/// 等待上限(<see cref="RateLimitOptions.AcquisitionTimeout"/>)預設 30 秒,幣安的 recvWindow 預設只有 5 秒。
+/// 0.3.0 開發中曾把簽章放在這裡之前,排隊超過 recvWindow 的請求一出去就被拒絕(<c>-1021</c>)。
+/// <b>It sits outside signing.</b> The signing handler signs and stamps the request only after the permit is
+/// held. Sign first and queue afterwards, and the timestamp ages in the queue: the wait ceiling
+/// (<see cref="RateLimitOptions.AcquisitionTimeout"/>) defaults to 30 seconds, while Binance's recvWindow defaults
+/// to 5. A 0.3.0 draft put signing ahead of this handler, and a request that queued longer than recvWindow was
+/// rejected the moment it went out (<c>-1021</c>).
+/// </para>
+/// <para>
+/// <b>等待許可的時間不計入單次嘗試逾時。</b>等待期間暫停重試處理器掛上的單次計時器,拿到許可後從頭起算;
+/// 等待本身由 <see cref="RateLimitOptions.AcquisitionTimeout"/> 與呼叫端的整體逾時約束。
+/// <b>Time spent waiting for permits does not count towards the attempt timeout.</b> The per-attempt timer the
+/// retry handler attached is paused during the wait and restarted from zero once the permit is held; the wait
+/// itself is bounded by <see cref="RateLimitOptions.AcquisitionTimeout"/> and the caller's overall timeout.
 /// </para>
 /// <para>
 /// 0.2.0 的註解寫著「放在重試外層,每次重試各自付權重」,推理剛好相反:外層只會被穿過一次,
@@ -83,11 +101,20 @@ public sealed class RateLimitingHandler : DelegatingHandler
         ArgumentNullException.ThrowIfNull(request);
 
         var weight = request.GetWeight() ?? _limiter.DefaultWeight;
+
+        // 排隊不算單次嘗試的時間:等待期間暫停計時,拿到許可後從頭起算。沒有重試處理器時沒有計時器,什麼都不做。
+        // Queueing is not attempt time: the clock pauses during the wait and restarts once the permit is held.
+        // Without a retry handler there is no timer and nothing happens.
+        var attemptTimer = AttemptTimer.Find(request);
+        attemptTimer?.Pause();
+
         var acquisition = await _limiter.AcquireAsync(weight, cancellationToken).ConfigureAwait(false);
         if (acquisition.IsFailure)
         {
             throw acquisition.Error.ToException();
         }
+
+        attemptTimer?.Restart();
 
         return await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
     }

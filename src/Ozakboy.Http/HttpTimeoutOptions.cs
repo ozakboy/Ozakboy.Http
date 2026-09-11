@@ -30,6 +30,15 @@ public sealed class HttpTimeoutOptions
     /// 單次嘗試的上限。逾時視為暫時性失敗,仍可能觸發重試。
     /// The bound for a single attempt. A timeout counts as transient and may trigger a retry.
     /// </summary>
+    /// <remarks>
+    /// 從拿到限流許可、開始送出時起算;在限流器前排隊的時間不計入(排隊由限流器自己的等待上限約束)。
+    /// 否則單次上限短於限流等待上限時,排隊久一點的請求就會逾時、被重試、重新排到隊伍最後面。
+    /// <see cref="OverallTimeout"/> 則仍涵蓋全部,包括排隊。
+    /// It starts once the rate-limit permit is held and the request goes out; time queueing at the limiter does
+    /// not count (the limiter's own ceiling bounds that). Otherwise, with this bound shorter than the limiter's,
+    /// a request that queued a little longer would time out and be retried at the back of the queue.
+    /// <see cref="OverallTimeout"/> still covers everything, queueing included.
+    /// </remarks>
     public TimeSpan AttemptTimeout { get; set; } = TimeSpan.FromSeconds(10);
 
     /// <summary>

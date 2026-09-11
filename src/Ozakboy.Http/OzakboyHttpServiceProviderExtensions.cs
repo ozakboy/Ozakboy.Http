@@ -64,4 +64,64 @@ public static class OzakboyHttpServiceProviderExtensions
 
         return holder.Masker;
     }
+
+    /// <summary>
+    /// 為以 <see cref="OzakboyHttpClientBuilderExtensions.AddOzakboyHttpPipeline"/> 註冊的具名用戶端建立
+    /// <see cref="HttpPipelineClient"/>,自動帶入該用戶端的遮罩器、同一份逾時設定與容器裡的時間來源。
+    /// 這是建立門面的建議做法。
+    /// Creates an <see cref="HttpPipelineClient"/> for a named client registered with
+    /// <see cref="OzakboyHttpClientBuilderExtensions.AddOzakboyHttpPipeline"/>, bringing in that client's masker,
+    /// the same timeout settings, and the container's time source. This is the recommended way to build the facade.
+    /// </summary>
+    /// <param name="provider">服務容器。The service provider.</param>
+    /// <param name="clientName">用戶端名稱,與 <c>AddHttpClient</c> 時相同。The client name used with <c>AddHttpClient</c>.</param>
+    /// <returns>新的門面。A new facade.</returns>
+    /// <remarks>
+    /// <para>
+    /// 門面是錯誤離開本套件前的最後一道關口,用的是建構時傳入的遮罩器。手動 <c>new</c> 時很容易漏傳,
+    /// 漏了也不會有任何錯誤 —— 那道關口只是默默地只認得 <see cref="SecretMasker.Default"/> 上的祕密。
+    /// 整體逾時也一樣:手動傳入的逾時設定可能與管線裡重試處理器用的那份不一致。這個方法把兩者都從註冊處取回。
+    /// The facade is the last checkpoint errors pass on their way out, and it masks with the masker it was
+    /// constructed with. Building it by hand makes that easy to forget, and forgetting raises no error — the
+    /// checkpoint just quietly knows only the secrets on <see cref="SecretMasker.Default"/>. The overall timeout is
+    /// the same story: timeouts passed by hand can drift from the ones the pipeline's retry handler uses. This
+    /// method takes both from the registration.
+    /// </para>
+    /// <para>
+    /// 做成服務容器上的方法、而不是再註冊一個服務,是讓生命週期留給呼叫端決定(通常是
+    /// <c>services.AddSingleton(p =&gt; p.CreateOzakboyHttpPipelineClient("exchange"))</c>),
+    /// 多個具名用戶端也不必各自註冊成帶鍵的 <see cref="HttpPipelineClient"/>。
+    /// It is a method on the service provider rather than another service registration so that the lifetime stays
+    /// the caller's choice (usually <c>services.AddSingleton(p =&gt; p.CreateOzakboyHttpPipelineClient("exchange"))</c>),
+    /// and several named clients need no keyed <see cref="HttpPipelineClient"/> registrations of their own.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="provider"/> 為 <see langword="null"/> 時擲出。
+    /// Thrown when <paramref name="provider"/> is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="clientName"/> 為 <see langword="null"/> 或空白時擲出。
+    /// Thrown when <paramref name="clientName"/> is <see langword="null"/> or blank.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// 這個名稱沒有以 <see cref="OzakboyHttpClientBuilderExtensions.AddOzakboyHttpPipeline"/> 註冊過時擲出。
+    /// Thrown when no client of that name was registered through
+    /// <see cref="OzakboyHttpClientBuilderExtensions.AddOzakboyHttpPipeline"/>.
+    /// </exception>
+    public static HttpPipelineClient CreateOzakboyHttpPipelineClient(this IServiceProvider provider, string clientName)
+    {
+        ArgumentNullException.ThrowIfNull(provider);
+        ArgumentException.ThrowIfNullOrWhiteSpace(clientName);
+
+        var registration = provider.GetKeyedService<ClientPipelineRegistration>(clientName)
+            ?? throw new InvalidOperationException(
+                "這個用戶端名稱沒有以 AddOzakboyHttpPipeline 註冊過,無法建立門面。No client of this name was registered through AddOzakboyHttpPipeline, so no facade can be built.");
+
+        return new HttpPipelineClient(
+            provider.GetRequiredService<IHttpClientFactory>().CreateClient(clientName),
+            registration.Timeouts,
+            provider.GetService<TimeProvider>(),
+            provider.GetOzakboyHttpMasker(clientName));
+    }
 }

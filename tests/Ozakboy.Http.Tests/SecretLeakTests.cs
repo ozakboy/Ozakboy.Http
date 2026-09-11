@@ -39,11 +39,10 @@ public sealed class SecretLeakTests
 
         using var provider = BuildProvider(clock, capture, stub);
         var masker = provider.GetOzakboyHttpMasker(ClientName);
-        var client = new HttpPipelineClient(
-            provider.GetRequiredService<IHttpClientFactory>().CreateClient(ClientName),
-            LongTimeouts(),
-            clock,
-            masker);
+        // 以建議做法建立門面:遮罩器與逾時由註冊處自動帶入,下面「位址中的祕密被遮掉」的斷言同時驗證了遮罩器確實帶進來了。
+        // The facade is built the recommended way, with masker and timeouts brought in from the registration; the
+        // "secret masked in the URI" assertions below also prove the masker really was carried in.
+        var client = provider.CreateOzakboyHttpPipelineClient(ClientName);
 
         // 可重試的 GET:次數用盡 → 重試處理器產生的錯誤。
         // A retryable GET: attempts run out, so the error comes from the retry handler.
@@ -228,12 +227,6 @@ public sealed class SecretLeakTests
 
     private static string Describe(Error error) =>
         $"{error.Code}|{error.Message}|{string.Join(";", error.Data?.Select(entry => $"{entry.Key}={entry.Value}") ?? [])}|{error.Exception}";
-
-    private static HttpTimeoutOptions LongTimeouts() => new()
-    {
-        AttemptTimeout = TimeSpan.FromMinutes(10),
-        OverallTimeout = TimeSpan.FromHours(1),
-    };
 
     private static ServiceProvider BuildProvider(FakeTimeProvider clock, CapturingLoggerProvider capture, StubHttpMessageHandler stub)
     {

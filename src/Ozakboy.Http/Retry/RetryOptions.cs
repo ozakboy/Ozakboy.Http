@@ -13,6 +13,15 @@ public sealed class RetryOptions
     /// The retry policy: attempt count, backoff shape, and jitter. Delays are always computed by the policy,
     /// never recomputed inside the handler.
     /// </summary>
+    /// <remarks>
+    /// 策略沒有設定 <see cref="RetryPolicy.RetryPredicate"/> 時,重試處理器另有一條規則:本地限流逾時
+    /// (<see cref="HttpErrorCodes.RateLimitTimeout"/>)不重試 —— 請求從未送出,且已經等滿了限流器的上限,
+    /// 再試只會把等待乘上嘗試次數。要重試它,請在 <see cref="RetryPolicy.RetryPredicate"/> 裡明說。
+    /// When the policy sets no <see cref="RetryPolicy.RetryPredicate"/>, the retry handler applies one more rule:
+    /// a local rate-limit timeout (<see cref="HttpErrorCodes.RateLimitTimeout"/>) is not retried — the request never
+    /// went out and has already waited out the limiter's ceiling, so another attempt only multiplies the wait. To
+    /// retry it anyway, say so in a <see cref="RetryPolicy.RetryPredicate"/>.
+    /// </remarks>
     public RetryPolicy Policy { get; set; } = RetryPolicy.Default;
 
     /// <summary>

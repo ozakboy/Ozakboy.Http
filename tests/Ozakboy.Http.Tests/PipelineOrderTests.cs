@@ -3,21 +3,22 @@ using System.Net;
 using System.Net.Http.Headers;
 using Microsoft.Extensions.DependencyInjection;
 using Ozakboy.Http.RateLimiting;
+using Ozakboy.Http.Retry;
 using Ozakboy.Http.Signing;
 using Ozakboy.Http.Tests.TestSupport;
 
 namespace Ozakboy.Http.Tests;
 
 /// <summary>
-/// 鎖住管線順序(重試 → 簽章 → 限流 → 日誌)帶來的行為:每一次嘗試都是一個新請求。
-/// Pins the behaviour that the pipeline order (retry, signing, rate limiting, logging) exists for: every attempt
-/// is a new request.
+/// 鎖住管線順序(重試 → 限流 → 簽章 → 日誌)帶來的行為:每一次嘗試都是一個新請求,時間戳是送出那一刻的。
+/// Pins the behaviour the pipeline order (retry, rate limiting, signing, logging) exists for: every attempt is a
+/// new request, and a timestamp is the moment the request goes out.
 /// </summary>
 /// <remarks>
-/// 0.2.0 的順序是「簽章 → 限流 → 重試 → 日誌」,與它自己的註解相反,而錯的順序不會有任何錯誤訊息。
-/// 這裡的前三條測試在那個順序下都會變紅。
-/// 0.2.0 ran "signing, rate limiting, retry, logging", contradicting its own comments, and a wrong order raises no
-/// error at all. The first three tests here all go red under that order.
+/// 錯的順序不會有任何錯誤訊息。0.2.0 的順序(簽章 → 限流 → 重試)讓前三條測試變紅;
+/// 0.3.0 開發中的順序(重試 → 簽章 → 限流)讓時間戳必須晚於放行時刻的那一條變紅。
+/// A wrong order raises no error at all. The 0.2.0 order (signing, rate limiting, retry) turns the first three
+/// tests red; the 0.3.0 draft order (retry, signing, rate limiting) turns the timestamp-after-release test red.
 /// </remarks>
 [TestClass]
 public sealed class PipelineOrderTests
@@ -25,6 +26,14 @@ public sealed class PipelineOrderTests
     private const string ClientName = "order";
     private const string SecretKey = "NhqPtmdSJYdKjVHjA7PZj4Mge3R5YNiP1e3UZjInClVN65XAbvqqM6A7H5fATj0j";
     private const string ApiKey = "vmPUZE6mv9SD5VNHk4HlWFsOr6aKE2zvsw0MuIgwCIPy6utIco14y7Ju91duEh8A";
+
+    private static readonly RetryPolicy ThreeAttempts = new()
+    {
+        MaxAttempts = 3,
+        BaseDelay = TimeSpan.FromMilliseconds(100),
+        Strategy = BackoffStrategy.Exponential,
+        JitterRatio = 0d,
+    };
 
     [TestMethod]
     public async Task EveryRetry_PaysItsOwnWeight()
@@ -121,17 +130,12 @@ public sealed class PipelineOrderTests
         var timestamps = new List<long>();
         foreach (var sent in stub.Requests)
         {
-            var query = sent.RequestUri!.Query.TrimStart('?');
-            var separator = query.IndexOf("&signature=", StringComparison.Ordinal);
-            Assert.IsGreaterThan(0, separator, $"送出的請求缺少簽章:{query}。The request went out unsigned: {query}.");
-
-            var canonical = query[..separator];
-            var signature = query[(separator + "&signature=".Length)..];
+            var (canonical, signature) = SplitSigned(sent.RequestUri!);
 
             // 時間戳在原位被換掉,不是另外附加一個:參數順序就是簽章順序。
             // The timestamp is replaced in place rather than appended: parameter order is signing order.
             StringAssert.StartsWith(canonical, "symbol=BTCUSDT&timestamp=", StringComparison.Ordinal);
-            var timestamp = long.Parse(canonical["symbol=BTCUSDT&timestamp=".Length..], CultureInfo.InvariantCulture);
+            var timestamp = ReadTimestamp(sent.RequestUri!);
             Assert.AreNotEqual(1L, timestamp, "呼叫端放的佔位時間戳必須被當下時間取代。The caller's placeholder timestamp must be replaced by the current time.");
             timestamps.Add(timestamp);
 
@@ -144,6 +148,45 @@ public sealed class PipelineOrderTests
             3,
             timestamps.Distinct().Count(),
             $"三次嘗試的時間戳必須各不相同,實際為 {string.Join(", ", timestamps)}。The three attempts must carry distinct timestamps.");
+    }
+
+    [TestMethod]
+    public async Task RequestHeldByTheLimiter_IsStampedAfterItIsReleased()
+    {
+        // 先簽章再排隊,時間戳就在隊伍裡過期(限流等待上限預設 30 秒,幣安 recvWindow 預設 5 秒)。
+        // 第二個請求要等到一分鐘後的下一個時間窗才放行,它的時間戳必須晚於放行時刻,而不是它開始排隊的時刻。
+        // Signed before queueing, a timestamp ages in the queue (the limiter waits up to 30 seconds by default,
+        // Binance's recvWindow defaults to 5). The second request is released only at the next window a minute
+        // later, and its timestamp must come after that release, not from when it started queueing.
+        var clock = new FakeTimeProvider();
+        var stub = StubHttpMessageHandler.AlwaysReturns(HttpStatusCode.OK);
+        using var provider = BuildProvider(clock, stub, permitLimit: 3, extra: options => options.Retry.Policy = RetryPolicy.NoRetry);
+        using var client = provider.GetRequiredService<IHttpClientFactory>().CreateClient(ClientName);
+        var releasedAt = clock.GetUtcNow() + TimeSpan.FromMinutes(1);
+
+        using var first = new HttpRequestMessage(HttpMethod.Get, "https://example.test/api").WithWeight(3);
+        using var firstResponse = await client.SendAsync(first, CancellationToken.None);
+
+        using var second = new HttpRequestMessage(HttpMethod.Get, "https://example.test/api/v3/account")
+            .WithQueryParameters(QueryParameters.CreateBuilder().Add("symbol", "BTCUSDT").Add("timestamp", 1L).Build())
+            .WithSignature()
+            .WithWeight(1);
+
+        var pending = client.SendAsync(second, CancellationToken.None);
+        Assert.IsFalse(pending.IsCompleted, "配額已用完,第二個請求應該在排隊。The quota is spent, so the second request should be queueing.");
+
+        using var response = await FakeClockRunner.RunAsync(clock, pending, TimeSpan.FromSeconds(1));
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+
+        var sentUri = stub.Requests[1].RequestUri!;
+        var timestamp = ReadTimestamp(sentUri);
+        Assert.IsTrue(
+            timestamp >= releasedAt.ToUnixTimeMilliseconds(),
+            $"時間戳 {timestamp} 早於放行時刻 {releasedAt.ToUnixTimeMilliseconds()}:請求是在排隊前簽的。The timestamp {timestamp} predates the release at {releasedAt.ToUnixTimeMilliseconds()}: the request was signed before it queued.");
+
+        var (canonical, signature) = SplitSigned(sentUri);
+        Assert.IsTrue(HmacSha256SignatureAlgorithm.Instance.Sign(canonical, SecretKey).TryGetValue(out var expected));
+        Assert.AreEqual(expected, signature);
     }
 
     [TestMethod]
@@ -227,13 +270,11 @@ public sealed class PipelineOrderTests
     }
 
     [TestMethod]
-    public async Task AttemptTimeoutWhileWaitingForPermits_IsReportedAsAnAttemptTimeout()
+    public async Task LimiterWait_DoesNotCountTowardsTheAttemptTimeout()
     {
-        // 限流在重試之內,單次嘗試逾時也涵蓋等待許可的時間。那時限流器看到的是取消,
-        // 但呼叫端什麼都沒取消 —— 回報必須是單次嘗試逾時(暫時性),不是呼叫端取消。
-        // Rate limiting sits inside retry, so the attempt timeout covers the wait for permits too. The limiter
-        // sees a cancellation, but the caller cancelled nothing: the report must be an attempt timeout
-        // (transient), not a caller cancellation.
+        // 單次嘗試逾時 2 秒,但請求要在限流器前排一分鐘。排隊不算嘗試時間,請求最後照常送出、成功。
+        // The attempt timeout is 2 seconds but the request queues at the limiter for a minute. Queueing is not
+        // attempt time, so the request eventually goes out and succeeds.
         var clock = new FakeTimeProvider();
         var stub = StubHttpMessageHandler.AlwaysReturns(HttpStatusCode.OK);
         using var provider = BuildProvider(clock, stub, permitLimit: 3, extra: options =>
@@ -243,6 +284,50 @@ public sealed class PipelineOrderTests
         });
 
         using var client = provider.GetRequiredService<IHttpClientFactory>().CreateClient(ClientName);
+        var start = clock.GetUtcNow();
+
+        using var first = new HttpRequestMessage(HttpMethod.Get, "https://example.test/api").WithWeight(3);
+        using var firstResponse = await client.SendAsync(first, CancellationToken.None);
+
+        using var second = new HttpRequestMessage(HttpMethod.Get, "https://example.test/api").WithWeight(1);
+        using var secondResponse = await FakeClockRunner.RunAsync(
+            clock,
+            client.SendAsync(second, CancellationToken.None),
+            TimeSpan.FromMilliseconds(500));
+
+        Assert.AreEqual(HttpStatusCode.OK, secondResponse.StatusCode);
+        Assert.AreEqual(2, stub.CallCount);
+        Assert.IsTrue(clock.GetUtcNow() - start >= TimeSpan.FromMinutes(1), "第二個請求確實排了一分鐘的隊。The second request really did queue for a minute.");
+    }
+
+    [TestMethod]
+    public async Task AttemptTimeout_StartsOnceThePermitIsGranted()
+    {
+        // 放行之後對方不回應:單次逾時從放行那一刻起算,2 秒後觸發。
+        // The peer never answers after the release: the attempt timeout runs from the moment of release and
+        // fires 2 seconds later.
+        var clock = new FakeTimeProvider();
+        DateTimeOffset? sentAt = null;
+        var stub = new StubHttpMessageHandler(async (_, attempt, token) =>
+        {
+            if (attempt == 1)
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK);
+            }
+
+            sentAt = clock.GetUtcNow();
+            await Task.Delay(Timeout.Infinite, token).ConfigureAwait(false);
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        });
+
+        using var provider = BuildProvider(clock, stub, permitLimit: 3, extra: options =>
+        {
+            options.Retry.Policy = RetryPolicy.NoRetry;
+            options.Timeouts.AttemptTimeout = TimeSpan.FromSeconds(2);
+        });
+
+        using var client = provider.GetRequiredService<IHttpClientFactory>().CreateClient(ClientName);
+        var start = clock.GetUtcNow();
 
         using var first = new HttpRequestMessage(HttpMethod.Get, "https://example.test/api").WithWeight(3);
         using var firstResponse = await client.SendAsync(first, CancellationToken.None);
@@ -252,10 +337,125 @@ public sealed class PipelineOrderTests
             clock,
             client.SendAsync(second, CancellationToken.None),
             TimeSpan.FromMilliseconds(500)));
+        var failedAt = clock.GetUtcNow();
 
         Assert.AreEqual(HttpErrorCodes.AttemptTimeout, exception.Error.Code);
-        Assert.AreEqual(ErrorCategory.Timeout, exception.Error.Category);
+        Assert.IsNotNull(sentAt, "請求必須在放行後送出才逾時。The request must have gone out before timing out.");
+        Assert.IsTrue(sentAt.Value - start >= TimeSpan.FromMinutes(1), "請求先排了一分鐘的隊。The request queued for a minute first.");
+
+        var measured = failedAt - sentAt.Value;
+        Assert.IsTrue(
+            measured >= TimeSpan.FromSeconds(2) && measured < TimeSpan.FromSeconds(3),
+            $"逾時必須從放行起算 2 秒,實際為 {measured}。The timeout must run 2 seconds from the release; it ran {measured}.");
+    }
+
+    [TestMethod]
+    public async Task OverallTimeout_StillCoversTheLimiterWait()
+    {
+        // 排隊不算單次嘗試,但整體逾時仍涵蓋全部;排隊中觸發要回報為整體逾時,不是呼叫端取消。
+        // Queueing is not attempt time, but the overall timeout still covers everything; firing during the queue
+        // is reported as the overall timeout, not a caller cancellation.
+        var clock = new FakeTimeProvider();
+        var stub = StubHttpMessageHandler.AlwaysReturns(HttpStatusCode.OK);
+        using var provider = BuildProvider(clock, stub, permitLimit: 3, extra: options =>
+        {
+            options.Retry.Policy = RetryPolicy.NoRetry;
+            options.Timeouts.AttemptTimeout = TimeSpan.FromSeconds(2);
+            options.Timeouts.OverallTimeout = TimeSpan.FromSeconds(10);
+        });
+
+        var pipeline = provider.CreateOzakboyHttpPipelineClient(ClientName);
+
+        using var first = new HttpRequestMessage(HttpMethod.Get, "https://example.test/api").WithWeight(3);
+        var firstResult = await pipeline.SendAsync(first, CancellationToken.None);
+        Assert.IsTrue(firstResult.TryGetValue(out var firstResponse));
+        firstResponse.Dispose();
+
+        using var second = new HttpRequestMessage(HttpMethod.Get, "https://example.test/api").WithWeight(1);
+        var result = await FakeClockRunner.RunAsync(clock, pipeline.SendAsync(second, CancellationToken.None), TimeSpan.FromSeconds(1));
+
+        Assert.IsTrue(result.IsFailure);
+        Assert.AreEqual(HttpErrorCodes.Timeout, result.Error!.Code);
+        Assert.AreEqual(ErrorCategory.Timeout, result.Error!.Category);
         Assert.AreEqual(1, stub.CallCount, "第二個請求從未離開本機。The second request never left the machine.");
+    }
+
+    [TestMethod]
+    public async Task LocalRateLimitTimeout_IsNotRetriedByTheDefaultPolicy()
+    {
+        // 限流器已經等滿了上限;重試只會把同樣長的等待乘上嘗試次數。
+        // The limiter has already waited out its ceiling; a retry only multiplies that wait by the attempt count.
+        var clock = new FakeTimeProvider();
+        var stub = new StubHttpMessageHandler((_, _, _) =>
+            throw Error.RateLimited(HttpErrorCodes.RateLimitTimeout, "排不到額度。No permits.").ToException());
+
+        using var client = CreateRetryClient(stub, clock, ThreeAttempts);
+        using var request = new HttpRequestMessage(HttpMethod.Get, "https://example.test/api");
+
+        var exception = await Assert.ThrowsExactlyAsync<ResultException>(() => client.SendAsync(request, CancellationToken.None));
+
+        Assert.AreEqual(1, stub.CallCount, "本地限流逾時不重試。A local rate-limit timeout is not retried.");
+        Assert.AreEqual(HttpErrorCodes.RateLimitTimeout, exception.Error.Code);
+        Assert.AreEqual(ErrorCategory.RateLimited, exception.Error.Category, "沒有重試過,就不是「已用盡」。Nothing was retried, so nothing was exhausted.");
+    }
+
+    [TestMethod]
+    public async Task LocalRateLimitTimeout_IsRetriedWhenThePredicateSaysSo()
+    {
+        // 設了判斷式就完全由它決定,與策略「取代而非附加」的語意一致。
+        // A predicate decides entirely for itself, in keeping with the policy's "replace, not add" semantics.
+        var clock = new FakeTimeProvider();
+        var stub = new StubHttpMessageHandler((_, _, _) =>
+            throw Error.RateLimited(HttpErrorCodes.RateLimitTimeout, "排不到額度。No permits.").ToException());
+
+        using var client = CreateRetryClient(stub, clock, ThreeAttempts with { RetryPredicate = error => error.IsTransient });
+        using var request = new HttpRequestMessage(HttpMethod.Get, "https://example.test/api");
+
+        var exception = await Assert.ThrowsExactlyAsync<ResultException>(() => FakeClockRunner.RunAsync(
+            clock,
+            client.SendAsync(request, CancellationToken.None),
+            TimeSpan.FromMilliseconds(50)));
+
+        Assert.AreEqual(3, stub.CallCount);
+        Assert.AreEqual(ErrorCategory.Exhausted, exception.Error.Category);
+    }
+
+    [TestMethod]
+    public async Task LocalRateLimitTimeout_ThroughThePipeline_IsNotRetried()
+    {
+        // 限流器排不到(下一個時間窗超過 5 秒的等待上限)就直接失敗;預設策略下只排這一次,不會重試到「已用盡」。
+        // The limiter gives up when the next window lies beyond its 5-second ceiling; under the default policy
+        // that happens once, not retried until "exhausted".
+        var clock = new FakeTimeProvider();
+        var stub = StubHttpMessageHandler.AlwaysReturns(HttpStatusCode.OK);
+        using var provider = BuildProvider(clock, stub, permitLimit: 3, extra: options =>
+            options.RateLimiting.AcquisitionTimeout = TimeSpan.FromSeconds(5));
+        using var client = provider.GetRequiredService<IHttpClientFactory>().CreateClient(ClientName);
+
+        using var first = new HttpRequestMessage(HttpMethod.Get, "https://example.test/api").WithWeight(3);
+        using var firstResponse = await client.SendAsync(first, CancellationToken.None);
+
+        using var second = new HttpRequestMessage(HttpMethod.Get, "https://example.test/api").WithWeight(1);
+        var exception = await Assert.ThrowsExactlyAsync<ResultException>(() => FakeClockRunner.RunAsync(
+            clock,
+            client.SendAsync(second, CancellationToken.None),
+            TimeSpan.FromMilliseconds(50)));
+
+        Assert.AreEqual(HttpErrorCodes.RateLimitTimeout, exception.Error.Code);
+        Assert.AreEqual(ErrorCategory.RateLimited, exception.Error.Category);
+        Assert.AreEqual(1, stub.CallCount);
+    }
+
+    [TestMethod]
+    public void CreateOzakboyHttpPipelineClient_RequiresThePipelineRegistration()
+    {
+        var services = new ServiceCollection();
+        services.AddHttpClient("logging-only").AddSanitizedLogging();
+        using var provider = services.BuildServiceProvider();
+
+        Assert.ThrowsExactly<InvalidOperationException>(() => provider.CreateOzakboyHttpPipelineClient("logging-only"));
+        Assert.ThrowsExactly<InvalidOperationException>(() => provider.CreateOzakboyHttpPipelineClient("nobody"));
+        Assert.ThrowsExactly<ArgumentNullException>(() => OzakboyHttpServiceProviderExtensions.CreateOzakboyHttpPipelineClient(null!, "x"));
     }
 
     [TestMethod]
@@ -304,6 +504,32 @@ public sealed class PipelineOrderTests
     public void SigningOptions_BlankTimestampName_IsInvalid() =>
         Assert.IsTrue(new SigningOptions { TimestampParameterName = " " }.Validate().IsFailure);
 
+    private static (string Canonical, string Signature) SplitSigned(Uri uri)
+    {
+        var query = uri.Query.TrimStart('?');
+        var separator = query.IndexOf("&signature=", StringComparison.Ordinal);
+        Assert.IsGreaterThan(0, separator, $"送出的請求缺少簽章:{query}。The request went out unsigned: {query}.");
+        return (query[..separator], query[(separator + "&signature=".Length)..]);
+    }
+
+    private static long ReadTimestamp(Uri uri)
+    {
+        var pair = uri.Query.TrimStart('?').Split('&').Single(part => part.StartsWith("timestamp=", StringComparison.Ordinal));
+        return long.Parse(pair["timestamp=".Length..], CultureInfo.InvariantCulture);
+    }
+
+    private static HttpClient CreateRetryClient(StubHttpMessageHandler stub, TimeProvider clock, RetryPolicy policy) =>
+        new(new RetryHandler(
+            new RetryOptions { Policy = policy },
+            new HttpTimeoutOptions { AttemptTimeout = TimeSpan.FromMinutes(10), OverallTimeout = TimeSpan.FromHours(1) },
+            clock)
+        {
+            InnerHandler = stub,
+        })
+        {
+            Timeout = Timeout.InfiniteTimeSpan,
+        };
+
     private static ServiceProvider BuildProvider(
         FakeTimeProvider clock,
         StubHttpMessageHandler stub,
@@ -321,13 +547,7 @@ public sealed class PipelineOrderTests
                 options.Signing.TimestampParameterName = "timestamp";
                 options.RateLimiting.AcquisitionTimeout = TimeSpan.FromHours(1);
                 options.RateLimiting.Buckets.Add(new RateLimitBucket("minute", permitLimit, TimeSpan.FromMinutes(1)));
-                options.Retry.Policy = new RetryPolicy
-                {
-                    MaxAttempts = 3,
-                    BaseDelay = TimeSpan.FromMilliseconds(100),
-                    Strategy = BackoffStrategy.Exponential,
-                    JitterRatio = 0d,
-                };
+                options.Retry.Policy = ThreeAttempts;
                 options.Timeouts.AttemptTimeout = TimeSpan.FromHours(1);
                 options.Timeouts.OverallTimeout = TimeSpan.FromHours(2);
                 extra?.Invoke(options);

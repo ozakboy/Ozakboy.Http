@@ -16,46 +16,53 @@ namespace Ozakboy.Http;
 /// <remarks>
 /// <para>
 /// <b>順序就是一切。</b><see cref="HttpClientFactoryServiceCollectionExtensions"/> 的管線是「先註冊的在外層」,
-/// 因此依序掛上:重試(最外層)→ 簽章 → 限流 → 脫敏日誌(最內層)。原則只有一條:<b>每一次嘗試都是一個新請求</b>。
+/// 因此依序掛上:重試(最外層)→ 限流 → 簽章 → 脫敏日誌(最內層)。原則有兩條:<b>每一次嘗試都是一個新請求</b>,
+/// 以及<b>時間戳要是送出那一刻的</b>。
 /// <b>Order is everything.</b> The <see cref="HttpClientFactoryServiceCollectionExtensions"/> pipeline puts the
-/// first-registered handler outermost, so the handlers go on as: retry (outermost), signing, rate limiting,
-/// sanitising logging (innermost). There is a single principle behind it: <b>every attempt is a new request</b>.
+/// first-registered handler outermost, so the handlers go on as: retry (outermost), rate limiting, signing,
+/// sanitising logging (innermost). Two principles drive it: <b>every attempt is a new request</b>, and <b>a
+/// timestamp must be the moment the request goes out</b>.
 /// </para>
 /// <list type="bullet">
 /// <item><description>
-/// <b>重試在最外層</b>,讓其餘三段在每一次嘗試都重新執行一遍。
-/// <b>Retry is outermost</b>, so the other three run again on every attempt.
-/// </description></item>
-/// <item><description>
-/// <b>簽章在重試之內</b>:每次嘗試重新簽章、蓋上當下的時間戳。放在重試外層,重試就沿用第一次的時間戳,
-/// 退避一久便被對方的時間窗拒絕(幣安 <c>-1021</c>)。
-/// <b>Signing is inside retry</b>: every attempt is re-signed with a current timestamp. Outside retry, a retry
-/// reuses the first timestamp and, after a long backoff, is rejected by the peer's time window
-/// (Binance <c>-1021</c>).
+/// <b>重試在最外層</b>,讓其餘三段在每一次嘗試都重新執行一遍。退避等待發生在這一層,不持有任何限流許可。
+/// <b>Retry is outermost</b>, so the other three run again on every attempt. Backoff waits happen at this level
+/// and hold no rate-limit permit.
 /// </description></item>
 /// <item><description>
 /// <b>限流在重試之內</b>:每次嘗試各付一份權重。放在重試外層只會被穿過一次,重試 N 次只付一份,
 /// 本地配額低估實際用量 —— 對以權重計算封鎖(418)的服務,錯誤率一高正是最危險的時候。
-/// 重試的退避等待發生在外層,不持有任何限流許可。
+/// 等待許可的時間不計入單次嘗試逾時(見 <see cref="RetryHandler"/>)。
 /// <b>Rate limiting is inside retry</b>: every attempt pays its own weight. Outside retry it is traversed once,
 /// so N retries pay for one and the local quota under-counts real usage — and for a service that bans by weight
-/// (418), a rising error rate is exactly when that matters most. Retry backoff happens outside and holds no
-/// rate-limit permit.
+/// (418), a rising error rate is exactly when that matters most. Time spent waiting for permits does not count
+/// towards the attempt timeout (see <see cref="RetryHandler"/>).
 /// </description></item>
 /// <item><description>
-/// <b>日誌在最內層</b>:記下真正送出去的那一份(已簽章、已放行、第幾次嘗試)。
-/// <b>Logging is innermost</b>: it records what actually went out — signed, admitted, and which attempt it was.
+/// <b>簽章在限流之內</b>:拿到許可之後才簽、才蓋時間戳。先簽再排隊,時間戳會在隊伍裡過期 ——
+/// 限流等待上限預設 30 秒,幣安的 recvWindow 預設只有 5 秒。
+/// <b>Signing is inside rate limiting</b>: the request is signed and stamped only once the permit is held. Sign
+/// first and queue afterwards, and the timestamp ages in the queue — the limiter waits up to 30 seconds by
+/// default, while Binance's recvWindow defaults to 5.
+/// </description></item>
+/// <item><description>
+/// <b>日誌在最內層</b>:記下真正送出去的那一份(已放行、已簽章、第幾次嘗試)。
+/// <b>Logging is innermost</b>: it records what actually went out — admitted, signed, and which attempt it was.
 /// </description></item>
 /// </list>
 /// <para>
-/// <b>0.2.0 的順序與註解相反。</b>0.2.0 依「簽章 → 限流 → 重試 → 日誌」掛上,註解卻宣稱限流在重試外層所以「每次重試各自付權重」、
-/// 簽章在外層所以「不會每次重試都重新簽」是好事。前者推理剛好相反(外層只付一次),後者則讓重試帶著過期的時間戳出去。
-/// 換了順序不會有任何錯誤訊息,只會在執行期表現成難以理解的行為,因此兩件事都有測試鎖住。
-/// <b>0.2.0 had the order and the comment contradicting each other.</b> It attached "signing, rate limiting,
-/// retry, logging" while claiming that rate limiting outside retry made "each retry pay its own weight", and that
-/// signing outside retry was good because it avoided re-signing. The first was exactly backwards (an outer
-/// handler pays once); the second sent retries out with a stale timestamp. A wrong order raises no error, only
-/// hard-to-read runtime behaviour, so both points are now pinned by tests.
+/// <b>這個順序是修了兩次才定下來的。</b>0.2.0 依「簽章 → 限流 → 重試 → 日誌」掛上,註解卻宣稱限流在重試外層所以
+/// 「每次重試各自付權重」—— 推理剛好相反(外層只付一次),重試也因此沿用過期的時間戳。0.3.0 開發中先改成
+/// 「重試 → 簽章 → 限流 → 日誌」,重試付權重、重新簽章都修好了,卻變成先簽章再排隊:排隊超過 recvWindow 的請求,
+/// 一拿到許可送出去就被拒絕(<c>-1021</c>)。最後定為限流在簽章之外。換了順序不會有任何錯誤訊息,
+/// 只會在執行期表現成難以理解的行為,因此每一點都有測試鎖住。
+/// <b>This order took two fixes to settle.</b> 0.2.0 attached "signing, rate limiting, retry, logging" while
+/// claiming that rate limiting outside retry made "each retry pay its own weight" — exactly backwards, since an
+/// outer handler pays once — and retries went out with a stale timestamp. A 0.3.0 draft moved to "retry,
+/// signing, rate limiting, logging": retries paid their weight and were re-signed, but requests were now signed
+/// before queueing, so one that queued longer than recvWindow was rejected the moment it went out
+/// (<c>-1021</c>). The final order puts rate limiting outside signing. A wrong order raises no error, only
+/// hard-to-read runtime behaviour, so every one of these points is pinned by a test.
 /// </para>
 /// </remarks>
 public static class OzakboyHttpClientBuilderExtensions
@@ -107,6 +114,12 @@ public static class OzakboyHttpClientBuilderExtensions
     /// alerted on. Any <see cref="HttpClient.Timeout"/> the caller configured earlier is overridden.
     /// </description></item>
     /// </list>
+    /// <para>
+    /// 門面請以 <see cref="OzakboyHttpServiceProviderExtensions.CreateOzakboyHttpPipelineClient"/> 建立:
+    /// 它帶入這個用戶端的遮罩器與同一份逾時設定。
+    /// Build the facade with <see cref="OzakboyHttpServiceProviderExtensions.CreateOzakboyHttpPipelineClient"/>,
+    /// which brings in this client's masker and the same timeout settings.
+    /// </para>
     /// </remarks>
     /// <exception cref="ArgumentNullException">
     /// 任一參數為 <see langword="null"/> 時擲出。Thrown when either argument is <see langword="null"/>.
@@ -131,6 +144,7 @@ public static class OzakboyHttpClientBuilderExtensions
         var clientName = builder.Name;
 
         builder.Services.AddKeyedSingleton(clientName, (_, _) => new ClientSecretMasker(CreatePipelineMasker(options)));
+        builder.Services.AddKeyedSingleton(clientName, (_, _) => new ClientPipelineRegistration(options.Timeouts));
 
         builder.RemoveAllLoggers();
         builder.ConfigureHttpClient(client => client.Timeout = Timeout.InfiniteTimeSpan);
@@ -144,14 +158,14 @@ public static class OzakboyHttpClientBuilderExtensions
             provider.GetService<TimeProvider>(),
             ResolveMasker(provider, clientName)));
 
-        if (options.EnableSigning)
-        {
-            builder.AddHttpMessageHandler(provider => new SigningHandler(options.Signing, provider.GetService<TimeProvider>()));
-        }
-
         if (options.EnableRateLimiting)
         {
             builder.AddWeightedRateLimiting(options.RateLimiting);
+        }
+
+        if (options.EnableSigning)
+        {
+            builder.AddHttpMessageHandler(provider => new SigningHandler(options.Signing, provider.GetService<TimeProvider>()));
         }
 
         builder.AddHttpMessageHandler(provider => new SanitizingLoggingHandler(
@@ -171,9 +185,9 @@ public static class OzakboyHttpClientBuilderExtensions
     /// <param name="options">簽章設定。The signing options.</param>
     /// <returns>建構器本身。The builder.</returns>
     /// <remarks>
-    /// 分段註冊時順序由呼叫端負責,請依型別說明的順序掛上:重試、簽章、限流、日誌。
+    /// 分段註冊時順序由呼叫端負責,請依型別說明的順序掛上:重試、限流、簽章、日誌。
     /// When registering sections individually the caller owns the order; follow the one in the type remarks:
-    /// retry, signing, rate limiting, logging.
+    /// retry, rate limiting, signing, logging.
     /// </remarks>
     public static IHttpClientBuilder AddRequestSigning(this IHttpClientBuilder builder, SigningOptions options)
     {

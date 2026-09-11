@@ -10,22 +10,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - 2026-09-12
 
 Fixes the pipeline order — which in 0.2.0 was the reverse of what its own comments described — and closes the
-places where a secret could leave the package unmasked. The rule behind the new order is a single sentence:
-every attempt is a new request, so every attempt is signed afresh and pays its own rate-limit weight.
+places where a secret could leave the package unmasked. Two rules sit behind the new order: every attempt is a
+new request, so every attempt pays its own rate-limit weight and is signed afresh; and a timestamp is the
+moment the request goes out, so signing happens only after the rate-limit permit is held.
 
 修正管線順序(0.2.0 的實際順序與它自己的註解相反),並補上祕密可能未經遮罩就流出本套件的缺口。
-新順序背後只有一條原則:每一次嘗試都是一個新請求 —— 各自重新簽章、各自付權重。
+新順序背後有兩條原則:每一次嘗試都是一個新請求 —— 各自付權重、各自重新簽章;時間戳要是送出那一刻的 —— 拿到限流許可之後才簽章。
 
 ### Fixed
 
 - **The pipeline order contradicted its own comments.** 0.2.0 attached signing → rate limiting → retry →
   logging. `IHttpClientFactory` puts the first-registered handler outermost, so retry sat *inside* signing and
   rate limiting, while the comments claimed rate limiting was "outside retry, so each retry pays its own
-  weight". The reasoning was exactly backwards. The order is now **retry (outermost) → signing → rate limiting
+  weight". The reasoning was exactly backwards. The order is now **retry (outermost) → rate limiting → signing
   → logging (innermost)**, with the reason for each position written into the XML docs, and tests that go red
-  under the 0.2.0 order.
+  under the 0.2.0 order. A development draft of 0.3.0 used retry → signing → rate limiting instead; that signed
+  requests before they queued for permits, and the limiter may wait 30 seconds against Binance's 5-second
+  recvWindow, so a request that queued long enough was rejected on arrival (`-1021`). The final order signs only
+  once the permit is held, pinned by a test that goes red under the draft order.
   管線順序與註解相反:0.2.0 依「簽章 → 限流 → 重試 → 日誌」掛上,重試實際在簽章與限流之內,註解卻宣稱限流在重試外層。
-  新順序為「重試(最外層)→ 簽章 → 限流 → 日誌(最內層)」,並有在舊順序下會變紅的測試鎖住。
+  新順序為「重試(最外層)→ 限流 → 簽章 → 日誌(最內層)」。0.3.0 開發中曾用「重試 → 簽章 → 限流」,
+  會先簽章再排隊,排隊超過 recvWindow 就被拒絕(`-1021`);定案版拿到許可後才簽章,兩種錯誤順序都有會變紅的測試鎖住。
 
 - **Retries paid no rate-limit weight.** With the limiter outside retry, it was traversed once per request, so a
   request retried N times paid for one. The local quota under-counted real usage exactly when the error rate was
@@ -37,10 +42,10 @@ every attempt is a new request, so every attempt is signed afresh and pays its o
 
 - **Retries reused the old timestamp.** With signing outside retry, every attempt carried the first attempt's
   signature and timestamp, so after a long backoff the retry was rejected by the peer's time window (Binance
-  `-1021`). Every attempt is now re-signed; set the new `SigningOptions.TimestampParameterName` and the signing
-  handler restamps that parameter with the current time on each attempt (in place, so the signing order is
-  unchanged).
-  重試沿用舊時間戳:現在每次嘗試都重新簽章;設定新的 `SigningOptions.TimestampParameterName`,時間戳參數會在原位換成當下時間。
+  `-1021`). Every attempt is now re-signed, after its permit is granted; set the new
+  `SigningOptions.TimestampParameterName` and the signing handler restamps that parameter with the current time
+  on each attempt (in place, so the signing order is unchanged).
+  重試沿用舊時間戳:現在每次嘗試都在拿到許可後重新簽章;設定新的 `SigningOptions.TimestampParameterName`,時間戳參數會在原位換成當下時間。
 
 - **Exceptions reached the logger and `Error` unmasked.** `SanitizingLoggingHandler` handed the original
   exception object to the logger, and `HttpErrorMapper.FromException` spliced the exception message into
@@ -63,6 +68,12 @@ every attempt is a new request, so every attempt is signed afresh and pays its o
   timing to the pipeline.
   `HttpClient.Timeout` 預設 100 秒若短於整體逾時,逾時會被錯歸為「取消」;現在設為無限,逾時交由管線處理。
 
+- **An overall timeout during a rate-limit wait was reported as a cancellation.** When
+  `HttpPipelineClient`'s overall timeout fired while the request was still queueing for permits, the limiter
+  reported `http.cancelled` and the facade passed it on, although the caller cancelled nothing. It is now
+  reported as `http.timeout`.
+  整體逾時在排隊等許可時觸發,原本被回報為「取消」;現在回報為 `http.timeout`。
+
 ### Added
 
 - **Secret registration.** `AddOzakboyHttpPipeline` registers `Signing.ApiKey`, `Signing.SecretKey`, and every
@@ -73,6 +84,14 @@ every attempt is a new request, so every attempt is signed afresh and pays its o
   message that never echoes the value; signing keys that short are skipped.
   祕密登記入口:簽章金鑰與新的 `HttpPipelineOptions.KnownSecrets` 自動登記到每個用戶端一份的遮罩器(以名稱為鍵的單例);
   執行期取得的祕密以 `GetOzakboyHttpMasker(clientName)` 取得同一個遮罩器再登記。
+
+- **`IServiceProvider.CreateOzakboyHttpPipelineClient(clientName)`, the recommended way to build the facade.**
+  It creates an `HttpPipelineClient` for a client registered with `AddOzakboyHttpPipeline`, bringing in that
+  client's masker and the very timeouts the pipeline's retry handler uses. Built by hand, forgetting the masker
+  raises no error — the facade just quietly knows only `SecretMasker.Default` — and hand-passed timeouts can drift
+  from the pipeline's. It is a provider method rather than another registration so the lifetime stays the
+  caller's: `services.AddSingleton(p => p.CreateOzakboyHttpPipelineClient("exchange"))`.
+  建立門面的建議做法:自動帶入該用戶端的遮罩器與管線同一份逾時設定,避免漏傳遮罩器;做成服務容器上的方法,生命週期由呼叫端決定。
 
 - **`SanitizedException`.** The stand-in used wherever an exception leaves the package: it keeps the original
   type name (`OriginalExceptionType`), the masked message and the masked full `ToString()` including the stack
@@ -95,11 +114,21 @@ What callers will notice:
 
 - **Every retry is signed afresh and pays its own weight.** Under failures the local limiter now fills faster
   than before — which is the point, since it now matches what the peer counts — and a retry may wait for
-  permits. The per-attempt timeout covers that wait; timing out while waiting is reported as
-  `http.attempt_timeout` (transient), not `http.cancelled`. A local limiter timeout (`http.rate_limit.timeout`,
-  transient) now happens inside retry, so the default policy retries it.
-  每次重試都重新簽章並付權重:錯誤時本地配額消耗得比以前快(這才對得上對方的計算),重試可能要等許可;
-  單次嘗試逾時涵蓋這段等待,等待中逾時回報為 `http.attempt_timeout` 而非 `http.cancelled`;本地限流逾時現在在重試之內,預設策略會重試它。
+  permits. Signing happens after the permit, so a timestamp never ages in the queue.
+  每次重試都重新付權重並重新簽章:錯誤時本地配額消耗得比以前快(這才對得上對方的計算),重試可能要等許可;
+  簽章在拿到許可之後,時間戳不會在排隊時過期。
+
+- **The attempt timeout no longer counts time spent queueing for permits.** It starts once the permit is held and
+  the request goes out: it measures how long the peer takes to answer. Counted from the start of the attempt,
+  Binance's default 10-second attempt bound against the limiter's 30-second ceiling would time out any request
+  that queued past 10 seconds and retry it at the back of the queue. The overall timeout still covers the queue.
+  單次嘗試逾時不再計入排隊等許可的時間,從拿到許可、開始送出時起算;整體逾時仍涵蓋排隊。
+
+- **A local rate-limit timeout (`http.rate_limit.timeout`) is not retried by the default policy.** The request
+  never went out and has already waited out the limiter's ceiling, so a retry only multiplies the wait by the
+  attempt count. It comes back as `RateLimited` (not `Exhausted`). A policy with a `RetryPredicate` decides for
+  itself, in keeping with the predicate replacing the built-in check.
+  本地限流逾時預設策略不重試(回報為 `RateLimited`、不是 `Exhausted`);策略設了 `RetryPredicate` 時由它決定。
 
 - **`Error.Exception` and `ResultException.InnerException` are `SanitizedException`,** never the original type.
   Code that did `ex.InnerException is HttpRequestException` should branch on `Error.Code` / `Error.Category`
@@ -107,9 +136,9 @@ What callers will notice:
   `Error.Exception` 與 `ResultException.InnerException` 一律是 `SanitizedException`,請改以 `Error.Code` / `Error.Category` 分支。
 
 - **`HttpPipelineClient` masks every failure it returns** — code, message, each data entry — with the masker it
-  was given. Pass the client's (`provider.GetOzakboyHttpMasker(name)`); without one it uses
-  `SecretMasker.Default` and knows only the secrets registered there.
-  `HttpPipelineClient` 回傳的每個失敗都經遮罩;請傳入用戶端的遮罩器,否則只認得 `SecretMasker.Default` 上的祕密。
+  was given. Build it with `provider.CreateOzakboyHttpPipelineClient(name)`, which passes the client's; a
+  hand-built one without a masker uses `SecretMasker.Default` and knows only the secrets registered there.
+  `HttpPipelineClient` 回傳的每個失敗都經遮罩;請以 `CreateOzakboyHttpPipelineClient` 建立,否則只認得 `SecretMasker.Default` 上的祕密。
 
 - **Clients built with `AddOzakboyHttpPipeline` have no default factory logging, and an infinite
   `HttpClient.Timeout`,** overriding any `Timeout` configured earlier. Bound the whole exchange through
@@ -128,8 +157,9 @@ What callers will notice:
   by real time rather than a step count. The old version could burn through its 200 steps during a cold start or
   a coverage run before the work had even registered its timer, then hang.
   測試用的假時鐘推進器改以真實時間節拍推進、以真實時間為上限;舊版在冷啟動或涵蓋率回合下會在工作掛上計時器前就用完步數。
-- 208 tests, all green across two normal runs and one coverage run; line coverage 96.0% on `Ozakboy.Http`.
-  208 個測試,兩次一般回合與一次涵蓋率回合全綠;行涵蓋率 96.0%。
+- 215 tests, all green across two normal runs and one coverage run; line coverage 95.9% on `Ozakboy.Http`.
+  Moving signing back ahead of rate limiting turns the timestamp-after-release test red.
+  215 個測試,兩次一般回合與一次涵蓋率回合全綠;行涵蓋率 95.9%。把簽章移回限流之前,時間戳必須晚於放行時刻的測試會變紅。
 
 ## [0.2.0] - 2026-09-11
 

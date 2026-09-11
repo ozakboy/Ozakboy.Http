@@ -128,6 +128,18 @@ public sealed class HttpPipelineClient
         {
             return await _httpClient.SendAsync(request, linked.Token).ConfigureAwait(false);
         }
+        catch (ResultException exception) when (
+            exception.Error.Category == ErrorCategory.Cancelled
+            && timeoutSource.IsCancellationRequested
+            && !cancellationToken.IsCancellationRequested)
+        {
+            // 請求還在限流器前排隊時整體逾時到了。限流器看到的是權杖被取消、回報「取消」,
+            // 但呼叫端什麼都沒取消 —— 這是整體逾時,必須照整體逾時回報,否則既不重試也不告警。
+            // The overall timeout expired while the request was still queueing at the limiter. The limiter saw its
+            // token cancelled and reported a cancellation, but the caller cancelled nothing: this is the overall
+            // timeout and must be reported as one, or it would be neither retried nor alerted on.
+            return Result.Failure<HttpResponseMessage>(ErrorSanitizer.Sanitize(OverallTimedOut(exception, _timeouts.OverallTimeout), _masker));
+        }
         catch (ResultException exception)
         {
             return Result.Failure<HttpResponseMessage>(ErrorSanitizer.Sanitize(exception.Error, _masker));
@@ -218,15 +230,18 @@ public sealed class HttpPipelineClient
 
         if (timeoutSource.IsCancellationRequested)
         {
-            return new Error(
-                HttpErrorCodes.Timeout,
-                $"整趟請求(含重試)超過 {overallTimeout} 未完成。The exchange, retries included, did not complete within {overallTimeout}.",
-                ErrorCategory.Timeout)
-            {
-                Exception = exception,
-            };
+            return OverallTimedOut(exception, overallTimeout);
         }
 
         return HttpErrorMapper.FromException(exception);
     }
+
+    private static Error OverallTimedOut(Exception cause, TimeSpan overallTimeout) =>
+        new(
+            HttpErrorCodes.Timeout,
+            $"整趟請求(含限流等待與重試)超過 {overallTimeout} 未完成。The exchange, rate-limit waits and retries included, did not complete within {overallTimeout}.",
+            ErrorCategory.Timeout)
+        {
+            Exception = cause,
+        };
 }

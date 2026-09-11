@@ -30,23 +30,37 @@ namespace Ozakboy.Http.Retry;
 /// the peer's instruction wins instead, capped by <see cref="RetryOptions.MaxRetryAfter"/>.
 /// </para>
 /// <para>
-/// <b>位置在管線最外層。</b>簽章、限流、日誌都在它之內,所以每一次嘗試都會重新簽章(新的時間戳)、重新付權重、
+/// <b>位置在管線最外層。</b>限流、簽章、日誌都在它之內,所以每一次嘗試都會重新付權重、重新簽章(新的時間戳)、
 /// 各自留下一筆日誌。退避等待發生在這一層,那時內層的限流器不持有任何許可。0.2.0 把它放在簽章與限流之內,
 /// 重試因此沿用舊的時間戳、也不付權重,見 <see cref="OzakboyHttpClientBuilderExtensions"/>。
-/// <b>It sits outermost in the pipeline.</b> Signing, rate limiting and logging are all inside it, so every
-/// attempt is re-signed with a fresh timestamp, pays its own weight, and leaves its own log line. Backoff waits
+/// <b>It sits outermost in the pipeline.</b> Rate limiting, signing and logging are all inside it, so every
+/// attempt pays its own weight, is re-signed with a fresh timestamp, and leaves its own log line. Backoff waits
 /// happen at this level, while the inner limiter holds no permit. In 0.2.0 it sat inside signing and rate
 /// limiting, so retries reused the old timestamp and paid no weight; see
 /// <see cref="OzakboyHttpClientBuilderExtensions"/>.
 /// </para>
 /// <para>
-/// 單次嘗試逾時涵蓋整個內層,包括等待限流許可的時間。等待許可時逾時會回報為
-/// <see cref="HttpErrorCodes.AttemptTimeout"/>,而不是限流器看到的「取消」—— 呼叫端並沒有取消。
-/// 本處理器產生的錯誤不攜帶原始例外物件,一律換成 <see cref="SanitizedException"/>。
-/// The per-attempt timeout covers everything inside, including the wait for rate-limit permits. Timing out
-/// during that wait is reported as <see cref="HttpErrorCodes.AttemptTimeout"/> rather than the cancellation the
-/// limiter sees — the caller cancelled nothing. Errors raised here never carry the original exception object;
-/// it is always swapped for a <see cref="SanitizedException"/>.
+/// <b>單次嘗試逾時從拿到限流許可、開始送出時才起算。</b>限流處理器等待許可期間,這個計時會暫停,拿到許可後從頭計時
+/// (見 <see cref="Ozakboy.Http.RateLimiting.RateLimitingHandler"/>)。單次逾時量的是「對方多久沒回應」;
+/// 排隊若也算進去,單次逾時(幣安預設 10 秒)短於限流等待上限(30 秒)時,排隊超過 10 秒的請求就會逾時、被重試、
+/// 重新排到隊伍最後面。排隊仍受限流器自己的上限與呼叫端的整體逾時約束。
+/// <b>The attempt timeout starts only once the rate-limit permit is held and the request goes out.</b> While
+/// the rate-limiting handler waits for permits the clock is paused, and it restarts from zero once they are
+/// granted (see <see cref="Ozakboy.Http.RateLimiting.RateLimitingHandler"/>). The attempt timeout measures how
+/// long the peer takes to answer; counting the queue as well would, whenever the attempt timeout (10 seconds by
+/// Binance's default) is shorter than the limiter's ceiling (30 seconds), time out any request that queued past
+/// 10 seconds and retry it at the back of the queue. The queue remains bounded by the limiter's own ceiling and
+/// the caller's overall timeout.
+/// </para>
+/// <para>
+/// <b>本地限流逾時(<see cref="HttpErrorCodes.RateLimitTimeout"/>)預設不重試。</b>那個請求從未送出,而且已經等滿了
+/// 限流器的等待上限;再試一次只會把同樣長的等待乘上嘗試次數。策略設了 <see cref="RetryPolicy.RetryPredicate"/>
+/// 時由它決定。本處理器產生的錯誤不攜帶原始例外物件,一律換成 <see cref="SanitizedException"/>。
+/// <b>A local rate-limit timeout (<see cref="HttpErrorCodes.RateLimitTimeout"/>) is not retried by
+/// default.</b> The request never went out and has already waited out the limiter's full ceiling; another
+/// attempt only multiplies that wait by the attempt count. A policy with a
+/// <see cref="RetryPolicy.RetryPredicate"/> decides for itself. Errors raised here never carry the original
+/// exception object; it is always swapped for a <see cref="SanitizedException"/>.
 /// </para>
 /// </remarks>
 public sealed class RetryHandler : DelegatingHandler
@@ -197,7 +211,7 @@ public sealed class RetryHandler : DelegatingHandler
                     // second layer of rules in this handler.
                     var error = HttpErrorMapper.WithRetryAfter(mapped, response, _timeProvider);
 
-                    if (!policy.ShouldRetry(attempt, error))
+                    if (!ShouldRetry(policy, attempt, error))
                     {
                         // 次數用盡也照樣把回應交還出去 —— 真實的狀態碼與內容比一個合成的錯誤有用,
                         // 而「這是不是最後一次」由呼叫端自己的重試層去判斷。
@@ -217,7 +231,7 @@ public sealed class RetryHandler : DelegatingHandler
                 }
                 catch (ResultException exception)
                 {
-                    if (!policy.ShouldRetry(attempt, exception.Error))
+                    if (!ShouldRetry(policy, attempt, exception.Error))
                     {
                         if (IsWorthRetrying(policy, exception.Error))
                         {
@@ -230,7 +244,7 @@ public sealed class RetryHandler : DelegatingHandler
                 catch (HttpRequestException exception)
                 {
                     var error = HttpErrorMapper.FromException(exception, _masker);
-                    if (!policy.ShouldRetry(attempt, error))
+                    if (!ShouldRetry(policy, attempt, error))
                     {
                         if (IsWorthRetrying(policy, error))
                         {
@@ -265,7 +279,38 @@ public sealed class RetryHandler : DelegatingHandler
     /// necessarily above 1 — the no-retry branch was taken otherwise — so the answer reflects only the error.
     /// A copied rule would be a second source of truth, and a change on the policy side would go unnoticed here.
     /// </remarks>
-    private static bool IsWorthRetrying(RetryPolicy policy, Error error) => policy.ShouldRetry(1, error);
+    private static bool IsWorthRetrying(RetryPolicy policy, Error error) => ShouldRetry(policy, 1, error);
+
+    /// <summary>
+    /// 問策略這次該不該重試,並套用本處理器唯一的額外規則:本地限流逾時預設不重試。
+    /// Asks the policy whether to retry, applying this handler's single extra rule: a local rate-limit timeout
+    /// is not retried by default.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="HttpErrorCodes.RateLimitTimeout"/> 的分類是 <see cref="ErrorCategory.RateLimited"/>(暫時性),
+    /// 對「稍後再試」的呼叫端而言沒錯;但在重試處理器裡,「稍後」就是立刻再排一次同樣長的隊。
+    /// 限流在重試之內,這條規則不寫在這裡,預設策略就會把等待乘上嘗試次數。
+    /// <see cref="HttpErrorCodes.RateLimitTimeout"/> is categorised <see cref="ErrorCategory.RateLimited"/>, which is
+    /// transient — right for a caller deciding to come back later, but inside the retry handler "later" means
+    /// queueing just as long again straight away. With rate limiting inside retry, the default policy would
+    /// multiply the wait by the attempt count without this rule.
+    /// </para>
+    /// <para>
+    /// 設了 <see cref="RetryPolicy.RetryPredicate"/> 的策略完全由它決定,與策略本身「取代而非附加」的語意一致。
+    /// A policy with a <see cref="RetryPolicy.RetryPredicate"/> is left entirely to it, in keeping with the
+    /// policy's own "replace, not add" semantics.
+    /// </para>
+    /// </remarks>
+    private static bool ShouldRetry(RetryPolicy policy, int attempt, Error error)
+    {
+        if (policy.RetryPredicate is null && string.Equals(error.Code, HttpErrorCodes.RateLimitTimeout, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return policy.ShouldRetry(attempt: attempt, error: error);
+    }
 
     /// <summary>
     /// 把「值得重試但次數已經用盡」的錯誤改標為 <see cref="ErrorCategory.Exhausted"/>。
@@ -312,30 +357,24 @@ public sealed class RetryHandler : DelegatingHandler
 
     private async Task<HttpResponseMessage> SendAttemptAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
-        using var timeoutSource = new CancellationTokenSource(_timeouts.AttemptTimeout, _timeProvider);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutSource.Token);
+        // 計時器掛在這次嘗試的請求上,內層的限流處理器等待許可時會暫停它、拿到許可後從頭起算(見型別說明)。
+        // The timer rides on this attempt's request; the inner rate-limiting handler pauses it while waiting for
+        // permits and restarts it once they are granted (see the type remarks).
+        using var timer = new AttemptTimer(_timeouts.AttemptTimeout, _timeProvider);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timer.Token);
+        AttemptTimer.Attach(request, timer);
 
         try
         {
             return await base.SendAsync(request, linked.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException exception) when (timeoutSource.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException exception) when (timer.HasExpired && !cancellationToken.IsCancellationRequested)
         {
             throw AttemptTimedOut(exception).ToException();
         }
-        catch (ResultException exception) when (
-            exception.Error.Category == ErrorCategory.Cancelled
-            && timeoutSource.IsCancellationRequested
-            && !cancellationToken.IsCancellationRequested)
+        finally
         {
-            // 限流在重試之內,單次嘗試逾時因此也涵蓋等待許可的時間。限流器看到的是權杖被取消,
-            // 回報的是「取消」;但呼叫端什麼都沒取消,是這次嘗試的時間用完了。不改標的話,
-            // 呼叫端會把它當成使用者取消 —— 既不重試、也不告警。
-            // Rate limiting sits inside retry, so the attempt timeout also covers the wait for permits. The
-            // limiter sees its token cancelled and reports a cancellation, but the caller cancelled nothing:
-            // this attempt ran out of time. Left unrelabelled, the caller would treat it as a user cancellation —
-            // neither retried nor alerted on.
-            throw AttemptTimedOut(exception).ToException();
+            AttemptTimer.Detach(request);
         }
     }
 
