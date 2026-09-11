@@ -7,6 +7,130 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-12
+
+Fixes the pipeline order — which in 0.2.0 was the reverse of what its own comments described — and closes the
+places where a secret could leave the package unmasked. The rule behind the new order is a single sentence:
+every attempt is a new request, so every attempt is signed afresh and pays its own rate-limit weight.
+
+修正管線順序(0.2.0 的實際順序與它自己的註解相反),並補上祕密可能未經遮罩就流出本套件的缺口。
+新順序背後只有一條原則:每一次嘗試都是一個新請求 —— 各自重新簽章、各自付權重。
+
+### Fixed
+
+- **The pipeline order contradicted its own comments.** 0.2.0 attached signing → rate limiting → retry →
+  logging. `IHttpClientFactory` puts the first-registered handler outermost, so retry sat *inside* signing and
+  rate limiting, while the comments claimed rate limiting was "outside retry, so each retry pays its own
+  weight". The reasoning was exactly backwards. The order is now **retry (outermost) → signing → rate limiting
+  → logging (innermost)**, with the reason for each position written into the XML docs, and tests that go red
+  under the 0.2.0 order.
+  管線順序與註解相反:0.2.0 依「簽章 → 限流 → 重試 → 日誌」掛上,重試實際在簽章與限流之內,註解卻宣稱限流在重試外層。
+  新順序為「重試(最外層)→ 簽章 → 限流 → 日誌(最內層)」,並有在舊順序下會變紅的測試鎖住。
+
+- **Retries paid no rate-limit weight.** With the limiter outside retry, it was traversed once per request, so a
+  request retried N times paid for one. The local quota under-counted real usage exactly when the error rate was
+  high — which, for a service that bans by weight (Binance's 418), is the worst moment to be wrong. Every attempt
+  now pays its own weight, and a retry that finds the quota exhausted waits for permits rather than bypassing
+  the limiter. The backoff wait itself holds no permit.
+  重試不付權重:限流器在重試外層只被穿過一次,重試 N 次只付一份,錯誤率高時本地配額低估實際用量。
+  現在每次嘗試各付權重,配額不足時重試會等待許可而不是繞過;退避等待期間不持有任何許可。
+
+- **Retries reused the old timestamp.** With signing outside retry, every attempt carried the first attempt's
+  signature and timestamp, so after a long backoff the retry was rejected by the peer's time window (Binance
+  `-1021`). Every attempt is now re-signed; set the new `SigningOptions.TimestampParameterName` and the signing
+  handler restamps that parameter with the current time on each attempt (in place, so the signing order is
+  unchanged).
+  重試沿用舊時間戳:現在每次嘗試都重新簽章;設定新的 `SigningOptions.TimestampParameterName`,時間戳參數會在原位換成當下時間。
+
+- **Exceptions reached the logger and `Error` unmasked.** `SanitizingLoggingHandler` handed the original
+  exception object to the logger, and `HttpErrorMapper.FromException` spliced the exception message into
+  `Error.Message` and kept the original in `Error.Exception`. A transport exception's message often carries the
+  request URI, and some services put the credential in its path; registered secrets had no effect on either
+  route. Both now use `SanitizedException` (see Added), and `Error.Message` and `Error.Data` go through literal
+  replacement of registered secrets.
+  例外未經遮罩:日誌處理器把原始例外交給記錄器,`HttpErrorMapper.FromException` 把例外訊息接進 `Error.Message`、
+  原物件放進 `Error.Exception`,已登記的祕密對這兩條路徑都無效。現在一律改用 `SanitizedException`。
+
+- **`IHttpClientFactory`'s default logging leaked full URIs.** Its `LogicalHandler` / `ClientHandler` logging
+  writes the full URI at Information level, and .NET redacts only the query, not the path — a straight leak for
+  a service with the credential in the path, such as Telegram's `/bot<token>/`. `AddOzakboyHttpPipeline` now
+  calls `RemoveAllLoggers()` on the client it builds; the package's own logging handler is masked.
+  預設 factory 日誌外洩完整位址(.NET 只遮 query、不遮路徑):`AddOzakboyHttpPipeline` 現在會呼叫 `RemoveAllLoggers()`。
+
+- **A timeout could be misfiled as a caller cancellation.** `HttpClient.Timeout` defaults to 100 seconds; when
+  that was shorter than `HttpTimeoutOptions.OverallTimeout` it fired first, surfaced as cancellation, and was
+  neither retried nor alerted on. `AddOzakboyHttpPipeline` now sets it to `Timeout.InfiniteTimeSpan` and leaves
+  timing to the pipeline.
+  `HttpClient.Timeout` 預設 100 秒若短於整體逾時,逾時會被錯歸為「取消」;現在設為無限,逾時交由管線處理。
+
+### Added
+
+- **Secret registration.** `AddOzakboyHttpPipeline` registers `Signing.ApiKey`, `Signing.SecretKey`, and every
+  value in the new `HttpPipelineOptions.KnownSecrets` on a per-client masker — a singleton keyed by client name,
+  so secrets survive `IHttpClientFactory` rebuilding its handler chain. `IServiceProvider.GetOzakboyHttpMasker(clientName)`
+  returns that masker, for secrets that only turn up at run time (a listenKey in a WebSocket path, say) and for
+  handing to `HttpPipelineClient`. Known secrets shorter than 8 characters are rejected at registration, with a
+  message that never echoes the value; signing keys that short are skipped.
+  祕密登記入口:簽章金鑰與新的 `HttpPipelineOptions.KnownSecrets` 自動登記到每個用戶端一份的遮罩器(以名稱為鍵的單例);
+  執行期取得的祕密以 `GetOzakboyHttpMasker(clientName)` 取得同一個遮罩器再登記。
+
+- **`SanitizedException`.** The stand-in used wherever an exception leaves the package: it keeps the original
+  type name (`OriginalExceptionType`), the masked message and the masked full `ToString()` including the stack
+  (`SanitizedDetails`), but has no inner exception and holds no reference to the original object.
+  取代原始例外的替身:保留型別名稱、遮罩後的訊息與遮罩後的堆疊,但沒有內層例外、不參照原物件。
+
+- **`SigningOptions.TimestampParameterName`.** Defaults to `null`, which leaves every parameter alone.
+  每次簽章都重新蓋時間戳的參數名,預設 `null`(不動任何參數)。
+
+- **Overloads taking a masker or a time source.** `HttpPipelineClient(httpClient, timeouts, timeProvider, masker)`,
+  `RetryHandler(options, timeouts, timeProvider, masker)`, `SanitizingLoggingHandler(logger, options,
+  timeProvider, masker)`, `HttpErrorMapper.FromException(exception, masker)`, and `SigningHandler(options,
+  timeProvider)`. Every 0.2.0 signature is still there, so code compiled against 0.2.0 keeps binding.
+  新增接受遮罩器或時間來源的多載;0.2.0 的所有簽章都保留。
+
+### Changed
+
+What callers will notice:
+呼叫端會注意到的行為變更:
+
+- **Every retry is signed afresh and pays its own weight.** Under failures the local limiter now fills faster
+  than before — which is the point, since it now matches what the peer counts — and a retry may wait for
+  permits. The per-attempt timeout covers that wait; timing out while waiting is reported as
+  `http.attempt_timeout` (transient), not `http.cancelled`. A local limiter timeout (`http.rate_limit.timeout`,
+  transient) now happens inside retry, so the default policy retries it.
+  每次重試都重新簽章並付權重:錯誤時本地配額消耗得比以前快(這才對得上對方的計算),重試可能要等許可;
+  單次嘗試逾時涵蓋這段等待,等待中逾時回報為 `http.attempt_timeout` 而非 `http.cancelled`;本地限流逾時現在在重試之內,預設策略會重試它。
+
+- **`Error.Exception` and `ResultException.InnerException` are `SanitizedException`,** never the original type.
+  Code that did `ex.InnerException is HttpRequestException` should branch on `Error.Code` / `Error.Category`
+  instead; the original type name is in `SanitizedException.OriginalExceptionType`.
+  `Error.Exception` 與 `ResultException.InnerException` 一律是 `SanitizedException`,請改以 `Error.Code` / `Error.Category` 分支。
+
+- **`HttpPipelineClient` masks every failure it returns** — code, message, each data entry — with the masker it
+  was given. Pass the client's (`provider.GetOzakboyHttpMasker(name)`); without one it uses
+  `SecretMasker.Default` and knows only the secrets registered there.
+  `HttpPipelineClient` 回傳的每個失敗都經遮罩;請傳入用戶端的遮罩器,否則只認得 `SecretMasker.Default` 上的祕密。
+
+- **Clients built with `AddOzakboyHttpPipeline` have no default factory logging, and an infinite
+  `HttpClient.Timeout`,** overriding any `Timeout` configured earlier. Bound the whole exchange through
+  `HttpTimeoutOptions.OverallTimeout` (via `HttpPipelineClient`) or your own cancellation token.
+  以 `AddOzakboyHttpPipeline` 建立的用戶端不再有預設 factory 日誌,`HttpClient.Timeout` 為無限(會覆蓋先前的設定)。
+
+- **`AddSanitizedLogging` registers a per-client masker too,** so a secret registered at run time survives handler
+  rebuilds; `AddRetry` uses that masker when one is registered for the same client name.
+  `AddSanitizedLogging` 也改為每個用戶端一份的遮罩器,執行期登記的祕密不會隨處理器重建而消失。
+
+### Notes
+
+- Targets `net10.0`. Dependencies unchanged; no third-party package anywhere in the transitive graph.
+  相依不變,遞移相依樹中仍無任何第三方套件。
+- The test helper that drives `FakeTimeProvider` now separates steps with a short real-time beat and is bounded
+  by real time rather than a step count. The old version could burn through its 200 steps during a cold start or
+  a coverage run before the work had even registered its timer, then hang.
+  測試用的假時鐘推進器改以真實時間節拍推進、以真實時間為上限;舊版在冷啟動或涵蓋率回合下會在工作掛上計時器前就用完步數。
+- 208 tests, all green across two normal runs and one coverage run; line coverage 96.0% on `Ozakboy.Http`.
+  208 個測試,兩次一般回合與一次涵蓋率回合全綠;行涵蓋率 96.0%。
+
 ## [0.2.0] - 2026-09-11
 
 Upgrades to `Ozakboy.Core.Abstractions` 0.3.0 and takes up what that version added — APIs that exist
@@ -145,6 +269,7 @@ dependency graph. Written for an automated trading engine, but nothing about tra
   the third-party `Polly.Core`.
   刻意排除 `Microsoft.Extensions.Http.Resilience`(遞移相依第三方的 `Polly.Core`)。
 
-[Unreleased]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ozakboy/Ozakboy.Http/releases/tag/v0.1.0

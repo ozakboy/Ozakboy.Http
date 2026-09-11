@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Net;
 using Ozakboy.Core.Abstractions;
+using Ozakboy.Security.Masking;
 
 namespace Ozakboy.Http;
 
@@ -82,26 +83,57 @@ public static class HttpErrorMapper
     /// <see cref="ErrorCategory.Cancelled"/>, which is not retryable; a caller that knows it was a timeout
     /// (<see cref="HttpPipelineClient"/>, which holds the timeout token) substitutes the timeout error itself.
     /// </remarks>
-    public static Error FromException(Exception exception)
+    public static Error FromException(Exception exception) => FromException(exception, SecretMasker.Default);
+
+    /// <summary>
+    /// 把傳輸層例外對映成錯誤,並以指定的遮罩器遮掉祕密。
+    /// Maps a transport-level exception onto an error, masking secrets with the given masker.
+    /// </summary>
+    /// <param name="exception">例外。The exception.</param>
+    /// <param name="masker">
+    /// 遮罩器,通常是登記了這個用戶端祕密的那一個(見 <see cref="OzakboyHttpServiceProviderExtensions.GetOzakboyHttpMasker"/>)。
+    /// The masker, usually the one carrying this client's secrets (see
+    /// <see cref="OzakboyHttpServiceProviderExtensions.GetOzakboyHttpMasker"/>).
+    /// </param>
+    /// <returns>對應的錯誤。The mapped error.</returns>
+    /// <remarks>
+    /// <para>
+    /// 回傳的錯誤<b>絕不</b>攜帶原始例外物件:<see cref="Error.Exception"/> 一律是 <see cref="SanitizedException"/>,
+    /// <see cref="Error.Message"/> 也經過已登記祕密的字面替換。連線層例外的訊息常帶著請求位址,而位址的路徑段
+    /// 可能就是憑證 —— 0.2.0 把訊息原樣接進 <see cref="Error.Message"/>、原物件放進 <see cref="Error.Exception"/>,
+    /// 已登記的祕密對這兩條路徑完全無效。
+    /// The returned error <b>never</b> carries the original exception object: <see cref="Error.Exception"/> is
+    /// always a <see cref="SanitizedException"/>, and <see cref="Error.Message"/> goes through literal
+    /// replacement of registered secrets. A transport exception's message often carries the request URI, whose
+    /// path may be the credential itself; 0.2.0 spliced the message into <see cref="Error.Message"/> verbatim and
+    /// kept the original object in <see cref="Error.Exception"/>, where registered secrets had no effect at all.
+    /// </para>
+    /// <para>
+    /// 單參數多載使用 <see cref="SecretMasker.Default"/>,只攔得住登記在那一份共用遮罩器上的祕密。
+    /// The single-argument overload uses <see cref="SecretMasker.Default"/>, which catches only secrets
+    /// registered on that shared masker.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">
+    /// 任一參數為 <see langword="null"/> 時擲出。Thrown when either argument is <see langword="null"/>.
+    /// </exception>
+    public static Error FromException(Exception exception, SecretMasker masker)
     {
         ArgumentNullException.ThrowIfNull(exception);
+        ArgumentNullException.ThrowIfNull(masker);
 
-        return exception switch
+        var error = exception switch
         {
-            TimeoutException => new Error(HttpErrorCodes.Timeout, "請求逾時。The request timed out.", ErrorCategory.Timeout)
-            {
-                Exception = exception,
-            },
-            OperationCanceledException => new Error(HttpErrorCodes.Cancelled, "請求已取消。The request was cancelled.", ErrorCategory.Cancelled)
-            {
-                Exception = exception,
-            },
-            HttpRequestException => new Error(HttpErrorCodes.Network, $"連線失敗:{exception.Message}", ErrorCategory.Network)
-            {
-                Exception = exception,
-            },
-            _ => Error.FromException(exception, HttpErrorCodes.Network, ErrorCategory.Network),
+            TimeoutException => new Error(HttpErrorCodes.Timeout, "請求逾時。The request timed out.", ErrorCategory.Timeout),
+            OperationCanceledException => new Error(HttpErrorCodes.Cancelled, "請求已取消。The request was cancelled.", ErrorCategory.Cancelled),
+            HttpRequestException => new Error(HttpErrorCodes.Network, $"連線失敗:{exception.Message}", ErrorCategory.Network),
+            _ => new Error(
+                HttpErrorCodes.Network,
+                string.IsNullOrWhiteSpace(exception.Message) ? "傳輸層失敗。A transport failure occurred." : exception.Message,
+                ErrorCategory.Network),
         };
+
+        return ErrorSanitizer.Sanitize(error with { Exception = exception }, masker);
     }
 
     /// <summary>

@@ -58,6 +58,30 @@ public sealed class SigningOptions
     public ISignatureAlgorithm Algorithm { get; set; } = HmacSha256SignatureAlgorithm.Instance;
 
     /// <summary>
+    /// 每次簽章時要重新蓋上當下時間(Unix 毫秒)的參數名,例如幣安的 <c>timestamp</c>。
+    /// 預設 <see langword="null"/>:不動任何參數。
+    /// The parameter to restamp with the current time (Unix milliseconds) on every signing, such as Binance's
+    /// <c>timestamp</c>. Defaults to <see langword="null"/>: no parameter is touched.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 只重新簽章不夠。時間戳若是呼叫端組請求時就寫死在參數裡,每次重試重新算出的簽章仍然簽著同一個舊時間 ——
+    /// 退避一久,重試本身就會被對方的時間窗拒絕(幣安 <c>-1021</c>)。設定這個名稱之後,簽章處理器會在每一次嘗試
+    /// 以 <see cref="TimeProvider"/> 的當下時間取代它(位置不變;原本沒有則附加在尾端),再計算簽章。
+    /// Re-signing alone is not enough. If the timestamp was fixed in the parameters when the caller built the
+    /// request, every retry's fresh signature still signs the same old time, and after a long backoff the retry
+    /// itself is rejected by the peer's time window (Binance <c>-1021</c>). With this name set, the signing
+    /// handler replaces that parameter with the <see cref="TimeProvider"/>'s current time on every attempt (in
+    /// place, or appended when absent) before computing the signature.
+    /// </para>
+    /// <para>
+    /// 只作用於標記了 <see cref="HttpRequestMessageExtensions.WithSignature"/> 的請求。
+    /// Applies only to requests marked with <see cref="HttpRequestMessageExtensions.WithSignature"/>.
+    /// </para>
+    /// </remarks>
+    public string? TimestampParameterName { get; set; }
+
+    /// <summary>
     /// 檢查設定是否可用。
     /// Validates the options.
     /// </summary>
@@ -80,6 +104,11 @@ public sealed class SigningOptions
         if (SendApiKeyHeader && string.IsNullOrWhiteSpace(ApiKeyHeaderName))
         {
             return Error.Validation(HttpErrorCodes.InvalidOptions, "API 金鑰標頭名不可為空白。The API key header name must not be blank.");
+        }
+
+        if (TimestampParameterName is not null && string.IsNullOrWhiteSpace(TimestampParameterName))
+        {
+            return Error.Validation(HttpErrorCodes.InvalidOptions, "時間戳參數名不可為空白;不需要時請設為 null。The timestamp parameter name must not be blank; set it to null when unused.");
         }
 
         return Result.Success();

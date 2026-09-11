@@ -16,10 +16,12 @@ namespace Ozakboy.Http;
 /// </para>
 /// <para>
 /// 整體逾時由 <see cref="HttpPipelineClient"/> 施加,單次嘗試逾時由重試處理器施加。
-/// 直接使用 <see cref="HttpClient"/> 的呼叫端,整體逾時請設在 <see cref="HttpClient.Timeout"/>。
+/// <see cref="OzakboyHttpClientBuilderExtensions.AddOzakboyHttpPipeline"/> 會把 <see cref="HttpClient.Timeout"/>
+/// 設為無限,讓逾時完全交給這兩層;不走 <see cref="HttpPipelineClient"/> 的呼叫端,整體上限請以自己的取消權杖施加。
 /// The overall bound is applied by <see cref="HttpPipelineClient"/> and the per-attempt bound by the retry
-/// handler. Callers using a bare <see cref="HttpClient"/> should put the overall bound on
-/// <see cref="HttpClient.Timeout"/>.
+/// handler. <see cref="OzakboyHttpClientBuilderExtensions.AddOzakboyHttpPipeline"/> sets
+/// <see cref="HttpClient.Timeout"/> to infinite so these two layers own timing entirely; callers who bypass
+/// <see cref="HttpPipelineClient"/> should impose the overall bound with their own cancellation token.
 /// </para>
 /// </remarks>
 public sealed class HttpTimeoutOptions

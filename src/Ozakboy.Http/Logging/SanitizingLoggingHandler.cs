@@ -13,10 +13,19 @@ namespace Ozakboy.Http.Logging;
 /// <remarks>
 /// <para>
 /// 放在最內層是為了記錄「真正送出去的那一份」:簽章已附上、限流已放行、這是第幾次重試也已確定。
-/// 放在外層只會看到呼叫端的意圖,看不到實際發生的事。
+/// 重試在管線最外層,所以每一次嘗試各留一筆。放在外層只會看到呼叫端的意圖,看不到實際發生的事。
 /// The innermost position is what makes the log show what actually went out: the signature is attached, rate
-/// limiting has admitted it, and which retry this is has been decided. Logging from outside would show the
-/// caller's intent rather than events.
+/// limiting has admitted it, and which retry this is has been decided. Retry is outermost, so every attempt
+/// leaves its own entry. Logging from outside would show the caller's intent rather than events.
+/// </para>
+/// <para>
+/// <b>記錄器永遠拿不到原始例外物件。</b>失敗時交給記錄器的是 <see cref="SanitizedException"/>:
+/// 型別名稱、遮罩後的訊息與遮罩後的堆疊都在,但沒有內層例外、也不參照原物件。
+/// 0.2.0 把原始例外直接交出去,連線層例外的訊息若帶著位址(路徑裡可能就是憑證),就原封不動寫進日誌。
+/// <b>The logger never receives the original exception object.</b> On failure it gets a
+/// <see cref="SanitizedException"/>: the type name, masked message and masked stack are all there, but there is
+/// no inner exception and no reference to the original. 0.2.0 handed the original over, so a transport exception
+/// whose message carried the URI — whose path may be the credential — went into the log untouched.
 /// </para>
 /// <para>
 /// 只相依 <see cref="ILogger"/> 抽象,不綁定任何具體日誌實作。
@@ -45,6 +54,39 @@ public sealed partial class SanitizingLoggingHandler : DelegatingHandler
     /// 設定不合法時擲出。Thrown when the options are invalid.
     /// </exception>
     public SanitizingLoggingHandler(ILogger logger, RequestLoggingOptions? options = null, TimeProvider? timeProvider = null)
+        : this(logger, options, timeProvider, null)
+    {
+    }
+
+    /// <summary>
+    /// 以指定的遮罩器建立處理器。
+    /// Creates the handler with a given masker.
+    /// </summary>
+    /// <param name="logger">日誌器。The logger.</param>
+    /// <param name="options">日誌設定;<see langword="null"/> 時使用預設值。The logging options; defaults are used when <see langword="null"/>.</param>
+    /// <param name="timeProvider">時間來源,用於量測耗時。The time source, used to measure elapsed time.</param>
+    /// <param name="masker">
+    /// 遮罩器;<see langword="null"/> 時依 <paramref name="options"/> 建立一個。傳入時直接使用它,
+    /// <see cref="RequestLoggingOptions.AdditionalSensitiveParameterNames"/> 應已反映在建立它的設定裡。
+    /// The masker; one is built from <paramref name="options"/> when <see langword="null"/>. When supplied it is
+    /// used as is, so <see cref="RequestLoggingOptions.AdditionalSensitiveParameterNames"/> should already be
+    /// reflected in whatever built it.
+    /// </param>
+    /// <remarks>
+    /// 傳入共用的遮罩器,是讓執行期登記的祕密不會隨著 <see cref="System.Net.Http.IHttpClientFactory"/>
+    /// 重建處理器而消失,也讓日誌與錯誤邊界用同一份祕密清單。
+    /// Passing a shared masker keeps secrets registered at run time from vanishing when
+    /// <see cref="System.Net.Http.IHttpClientFactory"/> rebuilds handlers, and lets logging and the error boundary
+    /// work from one list of secrets.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="logger"/> 為 <see langword="null"/> 時擲出。
+    /// Thrown when <paramref name="logger"/> is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// 設定不合法時擲出。Thrown when the options are invalid.
+    /// </exception>
+    public SanitizingLoggingHandler(ILogger logger, RequestLoggingOptions? options, TimeProvider? timeProvider, SecretMasker? masker)
     {
         ArgumentNullException.ThrowIfNull(logger);
 
@@ -57,7 +99,7 @@ public sealed partial class SanitizingLoggingHandler : DelegatingHandler
 
         _logger = logger;
         _options = effectiveOptions;
-        _masker = effectiveOptions.CreateMasker();
+        _masker = masker ?? effectiveOptions.CreateMasker();
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
@@ -134,19 +176,23 @@ public sealed partial class SanitizingLoggingHandler : DelegatingHandler
 
             return response;
         }
+        // 交給記錄器的一律是替身,原始例外照常往外拋 —— 外層的重試處理器要靠它的型別分類,
+        // 而它離開管線之前會在錯誤邊界上再被換成替身一次。
+        // The logger always gets the stand-in while the original keeps propagating: the retry handler outside
+        // classifies by its type, and it is swapped for a stand-in again at the error boundary before leaving.
         catch (ResultException exception)
         {
-            LogRequestFailed(_logger, method, uri, (long)_timeProvider.GetElapsedTime(start).TotalMilliseconds, exception);
+            LogRequestFailed(_logger, method, uri, (long)_timeProvider.GetElapsedTime(start).TotalMilliseconds, ErrorSanitizer.Sanitize(exception, _masker));
             throw;
         }
         catch (HttpRequestException exception)
         {
-            LogRequestFailed(_logger, method, uri, (long)_timeProvider.GetElapsedTime(start).TotalMilliseconds, exception);
+            LogRequestFailed(_logger, method, uri, (long)_timeProvider.GetElapsedTime(start).TotalMilliseconds, ErrorSanitizer.Sanitize(exception, _masker));
             throw;
         }
         catch (OperationCanceledException exception)
         {
-            LogRequestFailed(_logger, method, uri, (long)_timeProvider.GetElapsedTime(start).TotalMilliseconds, exception);
+            LogRequestFailed(_logger, method, uri, (long)_timeProvider.GetElapsedTime(start).TotalMilliseconds, ErrorSanitizer.Sanitize(exception, _masker));
             throw;
         }
     }

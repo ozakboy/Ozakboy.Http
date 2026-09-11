@@ -158,7 +158,12 @@ public sealed class SanitizingLoggingHandlerTests
         using var request = new HttpRequestMessage(HttpMethod.Get, "https://example.test/api");
 
         await Assert.ThrowsExactlyAsync<HttpRequestException>(() => client.SendAsync(request, CancellationToken.None));
-        Assert.IsTrue(logger.Entries.Any(entry => entry.Level == LogLevel.Error && entry.Exception is HttpRequestException));
+        // 記錄器拿到的是替身,不是原始例外物件;原始型別名稱仍保留供診斷。
+        // The logger receives the stand-in, not the original object; the original type name survives for diagnosis.
+        Assert.IsTrue(logger.Entries.Any(entry =>
+            entry.Level == LogLevel.Error
+            && entry.Exception is SanitizedException { OriginalExceptionType: "System.Net.Http.HttpRequestException" }));
+        Assert.IsFalse(logger.Entries.Any(entry => entry.Exception is HttpRequestException));
     }
 
     [TestMethod]

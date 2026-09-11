@@ -6,17 +6,22 @@ using Ozakboy.Core.Abstractions;
 namespace Ozakboy.Http.Signing;
 
 /// <summary>
-/// 管線的最外層:把請求攜帶的參數編碼進 URI(或請求主體),需要時再附上簽章與 API 金鑰標頭。
-/// The outermost handler: encodes the request's parameters into the URI (or body) and, when required, appends
-/// the signature and the API-key header.
+/// 把請求攜帶的參數編碼進 URI(或請求主體),需要時再附上簽章與 API 金鑰標頭。
+/// Encodes the request's parameters into the URI (or body) and, when required, appends the signature and the
+/// API-key header.
 /// </summary>
 /// <remarks>
 /// <para>
-/// 放在最外層是刻意的。簽章必須是最後才決定的內容之外的一切都已定案 —— 如果限流或重試在簽章之後
-/// 才改動請求,送出的字串就會與簽過的字串不一致。
-/// The position is deliberate. Everything that goes into the signature must already be settled: if rate
-/// limiting or retry modified the request after signing, the string sent would no longer match the string
-/// signed.
+/// <b>位置在重試之內、限流之外。</b>每一次嘗試都是一個新請求,必須重新簽章:時間戳要是當下的
+/// (見 <see cref="SigningOptions.TimestampParameterName"/>),否則退避一久,重試就會被對方的時間窗拒絕
+/// (幣安 <c>-1021</c>)。簽章之後的處理器(限流、日誌)都不改動請求內容,送出的字串因此與簽過的字串逐字相同。
+/// 0.2.0 把它放在最外層、重試之外,重試因此沿用第一次的簽章與時間戳 —— 當時的註解宣稱這是刻意的,推理剛好相反。
+/// <b>It sits inside retry and outside rate limiting.</b> Every attempt is a new request and has to be signed
+/// afresh with a current timestamp (see <see cref="SigningOptions.TimestampParameterName"/>); otherwise a long
+/// backoff gets the retry rejected by the peer's time window (Binance <c>-1021</c>). The handlers after it —
+/// rate limiting and logging — never alter the request, so the string sent matches the string signed byte for
+/// byte. In 0.2.0 it sat outermost, outside retry, so retries reused the first attempt's signature and
+/// timestamp; the comment of the time called that deliberate, with the reasoning exactly backwards.
 /// </para>
 /// <para>
 /// 未標記需要簽章、但帶有參數的請求,仍會把參數編碼進 URI。這樣公開端點與私有端點的組裝方式一致,
@@ -29,10 +34,11 @@ namespace Ozakboy.Http.Signing;
 public sealed class SigningHandler : DelegatingHandler
 {
     private readonly SigningOptions _options;
+    private readonly TimeProvider _timeProvider;
 
     /// <summary>
-    /// 以設定建立處理器。
-    /// Creates the handler from options.
+    /// 以設定建立處理器,時間來源為 <see cref="TimeProvider.System"/>。
+    /// Creates the handler from options, using <see cref="TimeProvider.System"/> as the time source.
     /// </summary>
     /// <param name="options">簽章設定。The signing options.</param>
     /// <exception cref="ArgumentNullException">
@@ -43,6 +49,29 @@ public sealed class SigningHandler : DelegatingHandler
     /// 設定不合法時擲出。Thrown when the options are invalid.
     /// </exception>
     public SigningHandler(SigningOptions options)
+        : this(options, null)
+    {
+    }
+
+    /// <summary>
+    /// 以設定與時間來源建立處理器。
+    /// Creates the handler from options and a time source.
+    /// </summary>
+    /// <param name="options">簽章設定。The signing options.</param>
+    /// <param name="timeProvider">
+    /// 蓋時間戳用的時間來源(見 <see cref="SigningOptions.TimestampParameterName"/>);<see langword="null"/> 時使用
+    /// <see cref="TimeProvider.System"/>。
+    /// The time source for restamping (see <see cref="SigningOptions.TimestampParameterName"/>);
+    /// <see cref="TimeProvider.System"/> when <see langword="null"/>.
+    /// </param>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="options"/> 為 <see langword="null"/> 時擲出。
+    /// Thrown when <paramref name="options"/> is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// 設定不合法時擲出。Thrown when the options are invalid.
+    /// </exception>
+    public SigningHandler(SigningOptions options, TimeProvider? timeProvider)
     {
         ArgumentNullException.ThrowIfNull(options);
 
@@ -53,6 +82,7 @@ public sealed class SigningHandler : DelegatingHandler
         }
 
         _options = options;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>
@@ -80,6 +110,18 @@ public sealed class SigningHandler : DelegatingHandler
         if (parameters is null && !requiresSignature)
         {
             return base.SendAsync(request, cancellationToken);
+        }
+
+        if (requiresSignature && _options.TimestampParameterName is { } timestampName)
+        {
+            // 每次嘗試都蓋上當下時間:重試處理器在外層,每一次嘗試都會重新走到這裡。
+            // 請求選項裡的參數是不可變的,這裡產生新實例,原請求(重試複製的來源)不受影響。
+            // Stamped with the current time on every attempt: retry sits outside, so every attempt passes
+            // through here again. The parameters in the request options are immutable; a new instance is made
+            // here and the original request, which retries clone from, is left alone.
+            var now = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
+            parameters = (parameters ?? QueryParameters.Empty)
+                .WithValue(timestampName, now.ToString(System.Globalization.CultureInfo.InvariantCulture));
         }
 
         var canonical = (parameters ?? QueryParameters.Empty).ToQueryString();

@@ -1,9 +1,11 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 using Ozakboy.Http.Logging;
 using Ozakboy.Http.RateLimiting;
 using Ozakboy.Http.Retry;
 using Ozakboy.Http.Signing;
+using Ozakboy.Security.Masking;
 
 namespace Ozakboy.Http;
 
@@ -14,28 +16,98 @@ namespace Ozakboy.Http;
 /// <remarks>
 /// <para>
 /// <b>順序就是一切。</b><see cref="HttpClientFactoryServiceCollectionExtensions"/> 的管線是「先註冊的在外層」,
-/// 因此必須依序掛上:簽章 → 限流 → 重試 → 脫敏日誌。
-/// 換了順序不會有任何錯誤訊息,只會在執行期表現成難以理解的行為:
-/// 簽章若排在重試內層,每次重試都會重新簽一次(時間戳變了,某些服務會直接拒絕);
-/// 限流若排在重試內層,重試風暴就不算權重,對方的配額會被打穿;
-/// 日誌若不在最內層,記到的是「打算送出的內容」而不是真正送出去的那一份。
-/// <b>Order is everything.</b> The <see cref="HttpClientFactoryServiceCollectionExtensions"/> pipeline puts
-/// the first-registered handler outermost, so they must go on in this sequence: signing, rate limiting, retry,
-/// sanitising logging. Getting it wrong produces no error at all, only behaviour that is hard to read at
-/// runtime: signing inside retry re-signs on every attempt with a fresh timestamp, which some services reject
-/// outright; rate limiting inside retry lets a retry storm consume no weight and blow through the peer's
-/// quota; and logging anywhere but innermost records what was meant to be sent rather than what was.
+/// 因此依序掛上:重試(最外層)→ 簽章 → 限流 → 脫敏日誌(最內層)。原則只有一條:<b>每一次嘗試都是一個新請求</b>。
+/// <b>Order is everything.</b> The <see cref="HttpClientFactoryServiceCollectionExtensions"/> pipeline puts the
+/// first-registered handler outermost, so the handlers go on as: retry (outermost), signing, rate limiting,
+/// sanitising logging (innermost). There is a single principle behind it: <b>every attempt is a new request</b>.
+/// </para>
+/// <list type="bullet">
+/// <item><description>
+/// <b>重試在最外層</b>,讓其餘三段在每一次嘗試都重新執行一遍。
+/// <b>Retry is outermost</b>, so the other three run again on every attempt.
+/// </description></item>
+/// <item><description>
+/// <b>簽章在重試之內</b>:每次嘗試重新簽章、蓋上當下的時間戳。放在重試外層,重試就沿用第一次的時間戳,
+/// 退避一久便被對方的時間窗拒絕(幣安 <c>-1021</c>)。
+/// <b>Signing is inside retry</b>: every attempt is re-signed with a current timestamp. Outside retry, a retry
+/// reuses the first timestamp and, after a long backoff, is rejected by the peer's time window
+/// (Binance <c>-1021</c>).
+/// </description></item>
+/// <item><description>
+/// <b>限流在重試之內</b>:每次嘗試各付一份權重。放在重試外層只會被穿過一次,重試 N 次只付一份,
+/// 本地配額低估實際用量 —— 對以權重計算封鎖(418)的服務,錯誤率一高正是最危險的時候。
+/// 重試的退避等待發生在外層,不持有任何限流許可。
+/// <b>Rate limiting is inside retry</b>: every attempt pays its own weight. Outside retry it is traversed once,
+/// so N retries pay for one and the local quota under-counts real usage — and for a service that bans by weight
+/// (418), a rising error rate is exactly when that matters most. Retry backoff happens outside and holds no
+/// rate-limit permit.
+/// </description></item>
+/// <item><description>
+/// <b>日誌在最內層</b>:記下真正送出去的那一份(已簽章、已放行、第幾次嘗試)。
+/// <b>Logging is innermost</b>: it records what actually went out — signed, admitted, and which attempt it was.
+/// </description></item>
+/// </list>
+/// <para>
+/// <b>0.2.0 的順序與註解相反。</b>0.2.0 依「簽章 → 限流 → 重試 → 日誌」掛上,註解卻宣稱限流在重試外層所以「每次重試各自付權重」、
+/// 簽章在外層所以「不會每次重試都重新簽」是好事。前者推理剛好相反(外層只付一次),後者則讓重試帶著過期的時間戳出去。
+/// 換了順序不會有任何錯誤訊息,只會在執行期表現成難以理解的行為,因此兩件事都有測試鎖住。
+/// <b>0.2.0 had the order and the comment contradicting each other.</b> It attached "signing, rate limiting,
+/// retry, logging" while claiming that rate limiting outside retry made "each retry pay its own weight", and that
+/// signing outside retry was good because it avoided re-signing. The first was exactly backwards (an outer
+/// handler pays once); the second sent retries out with a stale timestamp. A wrong order raises no error, only
+/// hard-to-read runtime behaviour, so both points are now pinned by tests.
 /// </para>
 /// </remarks>
 public static class OzakboyHttpClientBuilderExtensions
 {
     /// <summary>
-    /// 一次掛上整條管線。
-    /// Attaches the whole pipeline in one call.
+    /// 一次掛上整條管線,並把這個具名用戶端調整成適合它的狀態。
+    /// Attaches the whole pipeline in one call and adjusts the named client to suit it.
     /// </summary>
     /// <param name="builder">用戶端建構器。The client builder.</param>
     /// <param name="configure">設定委派。The configuration delegate.</param>
     /// <returns>建構器本身。The builder.</returns>
+    /// <remarks>
+    /// <para>
+    /// 除了四個處理器之外,這個方法還對這個具名用戶端做三件事:
+    /// Besides the four handlers, this method does three things to the named client:
+    /// </para>
+    /// <list type="number">
+    /// <item><description>
+    /// <b>登記祕密。</b><see cref="SigningOptions.ApiKey"/>、<see cref="SigningOptions.SecretKey"/> 與
+    /// <see cref="HttpPipelineOptions.KnownSecrets"/> 登記到這個用戶端的遮罩器(以用戶端名稱為鍵的單例,
+    /// 見 <see cref="OzakboyHttpServiceProviderExtensions.GetOzakboyHttpMasker"/>)。日誌、重試與錯誤都用它遮罩。
+    /// 短於 <see cref="SecretMasker.MinimumKnownSecretLength"/> 的簽章金鑰無法登記(會大量誤遮一般文字),會被略過。
+    /// <b>Registers secrets.</b> <see cref="SigningOptions.ApiKey"/>, <see cref="SigningOptions.SecretKey"/> and
+    /// <see cref="HttpPipelineOptions.KnownSecrets"/> go onto this client's masker — a singleton keyed by client
+    /// name, see <see cref="OzakboyHttpServiceProviderExtensions.GetOzakboyHttpMasker"/> — which logging, retry
+    /// and errors all mask with. A signing key shorter than <see cref="SecretMasker.MinimumKnownSecretLength"/>
+    /// cannot be registered (it would mask swathes of ordinary text) and is skipped.
+    /// </description></item>
+    /// <item><description>
+    /// <b>移除 <see cref="IHttpClientFactory"/> 預設的日誌</b>(<c>RemoveAllLoggers()</c>)。預設的
+    /// <c>LogicalHandler</c> / <c>ClientHandler</c> 日誌在 Information 層級寫出完整位址,.NET 只遮 query、不遮路徑;
+    /// 對憑證放在路徑裡的服務(例如 Telegram 的 <c>/bot&lt;token&gt;/</c>),那就是直接外洩。
+    /// 本套件自己的日誌處理器已經經過遮罩,不需要它們。
+    /// <b>Removes <see cref="IHttpClientFactory"/>'s default logging</b> (<c>RemoveAllLoggers()</c>). The default
+    /// <c>LogicalHandler</c> / <c>ClientHandler</c> logging writes the full URI at Information level, and .NET
+    /// redacts only the query, not the path; for a service with the credential in the path (Telegram's
+    /// <c>/bot&lt;token&gt;/</c>) that is a straight leak. This package's own logging handler is masked and makes
+    /// them unnecessary.
+    /// </description></item>
+    /// <item><description>
+    /// <b>把 <see cref="HttpClient.Timeout"/> 設為 <see cref="Timeout.InfiniteTimeSpan"/>。</b>逾時交給管線:
+    /// 單次嘗試由重試處理器、整趟由 <see cref="HttpPipelineClient"/> 負責。預設的 100 秒若短於
+    /// <see cref="HttpTimeoutOptions.OverallTimeout"/>,先觸發的會是它,而它表現成取消 ——
+    /// 逾時就被錯歸為「呼叫端取消」,既不重試也不告警。呼叫端先前自行設定的 <see cref="HttpClient.Timeout"/> 會被覆蓋。
+    /// <b>Sets <see cref="HttpClient.Timeout"/> to <see cref="Timeout.InfiniteTimeSpan"/>.</b> Timeouts belong to
+    /// the pipeline: the retry handler bounds each attempt and <see cref="HttpPipelineClient"/> the whole
+    /// exchange. The default 100 seconds, if shorter than <see cref="HttpTimeoutOptions.OverallTimeout"/>, fires
+    /// first and surfaces as cancellation, so a timeout is misfiled as a caller cancellation — neither retried nor
+    /// alerted on. Any <see cref="HttpClient.Timeout"/> the caller configured earlier is overridden.
+    /// </description></item>
+    /// </list>
+    /// </remarks>
     /// <exception cref="ArgumentNullException">
     /// 任一參數為 <see langword="null"/> 時擲出。Thrown when either argument is <see langword="null"/>.
     /// </exception>
@@ -56,9 +128,25 @@ public static class OzakboyHttpClientBuilderExtensions
             throw new ArgumentException(validation.Error.Message, nameof(configure));
         }
 
+        var clientName = builder.Name;
+
+        builder.Services.AddKeyedSingleton(clientName, (_, _) => new ClientSecretMasker(CreatePipelineMasker(options)));
+
+        builder.RemoveAllLoggers();
+        builder.ConfigureHttpClient(client => client.Timeout = Timeout.InfiniteTimeSpan);
+
+        // 以下的註冊順序就是管線順序(先註冊的在外層),理由見型別說明。
+        // The registration order below is the pipeline order (first registered is outermost); see the type
+        // remarks for why.
+        builder.AddHttpMessageHandler(provider => new RetryHandler(
+            options.Retry,
+            options.Timeouts,
+            provider.GetService<TimeProvider>(),
+            ResolveMasker(provider, clientName)));
+
         if (options.EnableSigning)
         {
-            builder.AddHttpMessageHandler(_ => new SigningHandler(options.Signing));
+            builder.AddHttpMessageHandler(provider => new SigningHandler(options.Signing, provider.GetService<TimeProvider>()));
         }
 
         if (options.EnableRateLimiting)
@@ -66,15 +154,11 @@ public static class OzakboyHttpClientBuilderExtensions
             builder.AddWeightedRateLimiting(options.RateLimiting);
         }
 
-        builder.AddHttpMessageHandler(provider => new RetryHandler(
-            options.Retry,
-            options.Timeouts,
-            provider.GetService<TimeProvider>()));
-
         builder.AddHttpMessageHandler(provider => new SanitizingLoggingHandler(
             CreateLogger(provider),
             options.Logging,
-            provider.GetService<TimeProvider>()));
+            provider.GetService<TimeProvider>(),
+            ResolveMasker(provider, clientName)));
 
         return builder;
     }
@@ -86,12 +170,17 @@ public static class OzakboyHttpClientBuilderExtensions
     /// <param name="builder">用戶端建構器。The client builder.</param>
     /// <param name="options">簽章設定。The signing options.</param>
     /// <returns>建構器本身。The builder.</returns>
+    /// <remarks>
+    /// 分段註冊時順序由呼叫端負責,請依型別說明的順序掛上:重試、簽章、限流、日誌。
+    /// When registering sections individually the caller owns the order; follow the one in the type remarks:
+    /// retry, signing, rate limiting, logging.
+    /// </remarks>
     public static IHttpClientBuilder AddRequestSigning(this IHttpClientBuilder builder, SigningOptions options)
     {
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(options);
 
-        return builder.AddHttpMessageHandler(_ => new SigningHandler(options));
+        return builder.AddHttpMessageHandler(provider => new SigningHandler(options, provider.GetService<TimeProvider>()));
     }
 
     /// <summary>
@@ -132,13 +221,24 @@ public static class OzakboyHttpClientBuilderExtensions
     /// <param name="options">重試設定。The retry options.</param>
     /// <param name="timeouts">逾時設定。The timeout options.</param>
     /// <returns>建構器本身。The builder.</returns>
+    /// <remarks>
+    /// 同一個用戶端名稱若也以 <see cref="AddSanitizedLogging"/> 註冊過,重試處理器產生的錯誤會用那一個遮罩器;
+    /// 否則用 <see cref="SecretMasker.Default"/>。
+    /// If the same client name was also registered with <see cref="AddSanitizedLogging"/>, errors raised by the
+    /// retry handler are masked with that masker; otherwise with <see cref="SecretMasker.Default"/>.
+    /// </remarks>
     public static IHttpClientBuilder AddRetry(this IHttpClientBuilder builder, RetryOptions options, HttpTimeoutOptions? timeouts = null)
     {
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(options);
 
+        var clientName = builder.Name;
         return builder.AddHttpMessageHandler(provider =>
-            new RetryHandler(options, timeouts, provider.GetService<TimeProvider>()));
+            new RetryHandler(
+                options,
+                timeouts,
+                provider.GetService<TimeProvider>(),
+                provider.GetKeyedService<ClientSecretMasker>(clientName)?.Masker));
     }
 
     /// <summary>
@@ -148,13 +248,61 @@ public static class OzakboyHttpClientBuilderExtensions
     /// <param name="builder">用戶端建構器。The client builder.</param>
     /// <param name="options">日誌設定。The logging options.</param>
     /// <returns>建構器本身。The builder.</returns>
+    /// <remarks>
+    /// 遮罩器以用戶端名稱為鍵註冊成單例(若尚未註冊),可用
+    /// <see cref="OzakboyHttpServiceProviderExtensions.GetOzakboyHttpMasker"/> 取得並登記祕密。
+    /// 這個方法不會移除 <see cref="IHttpClientFactory"/> 的預設日誌;需要時請自行呼叫 <c>RemoveAllLoggers()</c>。
+    /// The masker is registered as a singleton keyed by client name (unless one already is) and can be fetched
+    /// with <see cref="OzakboyHttpServiceProviderExtensions.GetOzakboyHttpMasker"/> to register secrets. This method
+    /// does not remove <see cref="IHttpClientFactory"/>'s default logging; call <c>RemoveAllLoggers()</c> yourself
+    /// when needed.
+    /// </remarks>
     public static IHttpClientBuilder AddSanitizedLogging(this IHttpClientBuilder builder, RequestLoggingOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(builder);
 
+        var clientName = builder.Name;
+        var effectiveOptions = options ?? new RequestLoggingOptions();
+        builder.Services.TryAddKeyedSingleton(clientName, (_, _) => new ClientSecretMasker(effectiveOptions.CreateMasker()));
+
         return builder.AddHttpMessageHandler(provider =>
-            new SanitizingLoggingHandler(CreateLogger(provider), options, provider.GetService<TimeProvider>()));
+            new SanitizingLoggingHandler(
+                CreateLogger(provider),
+                effectiveOptions,
+                provider.GetService<TimeProvider>(),
+                ResolveMasker(provider, clientName)));
     }
+
+    private static SecretMasker CreatePipelineMasker(HttpPipelineOptions options)
+    {
+        var masker = options.Logging.CreateMasker();
+
+        // 簽章金鑰一拿到就登記:它們之後從哪條路徑流出來(例外訊息、對方 echo 回的錯誤、自訂標頭),
+        // 字面替換都攔得到,不必指望每條路徑都有欄位名可以判斷。
+        // The signing keys are registered as soon as they are known: whichever path they later leak through —
+        // an exception message, an error echoed back by the peer, a custom header — literal replacement catches
+        // them, without relying on every path offering a field name to judge by.
+        RegisterIfUsable(masker, options.Signing.ApiKey);
+        RegisterIfUsable(masker, options.Signing.SecretKey);
+
+        foreach (var secret in options.KnownSecrets)
+        {
+            masker.RegisterKnownSecret(secret);
+        }
+
+        return masker;
+    }
+
+    private static void RegisterIfUsable(SecretMasker masker, string? secret)
+    {
+        if (!string.IsNullOrWhiteSpace(secret) && secret.Length >= SecretMasker.MinimumKnownSecretLength)
+        {
+            masker.RegisterKnownSecret(secret);
+        }
+    }
+
+    private static SecretMasker ResolveMasker(IServiceProvider provider, string clientName) =>
+        provider.GetRequiredKeyedService<ClientSecretMasker>(clientName).Masker;
 
     private static ILogger CreateLogger(IServiceProvider provider) =>
         provider.GetService<ILoggerFactory>()?.CreateLogger<SanitizingLoggingHandler>()

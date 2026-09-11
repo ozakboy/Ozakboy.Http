@@ -27,17 +27,25 @@ dotnet add package Ozakboy.Http
 四個處理器,**順序很重要**:
 
 ```
-簽章 → 限流 → 重試 → 脫敏日誌 → 網路
+重試 → 簽章 → 限流 → 脫敏日誌 → 網路
 ```
 
-順序錯了不會有任何錯誤訊息,只會在執行期表現成難以理解的行為:
+背後的原則只有一條:**每一次嘗試都是一個新請求**。重試放在最外層,其餘三段在每一次嘗試都重新執行一遍:
 
-- **簽章排在重試內層**:每次重試都重新簽一次,時間戳跟著變,某些服務會直接拒絕。
-- **限流排在重試內層**:重試風暴不算權重,對方的配額會被打穿。
-- **日誌不在最內層**:記到的是呼叫端打算送出的內容,不是真正送出去的那一份。
+- **簽章在重試之內**:每次嘗試都重新簽章;設定 `Signing.TimestampParameterName` 後,時間戳也會換成當下時間。重試若沿用第一次的時間戳,退避一久就會被對方的時間窗拒絕(幣安 `-1021`)。
+- **限流在重試之內**:每次嘗試各付一份權重。放在重試外層的話,重試 N 次只付一份,本地配額正好在錯誤率高的時候低估實際用量 —— 以權重計算封鎖(418)的服務,就是在那個時候封你。退避等待發生在限流器之外,不持有任何許可。
+- **日誌在最內層**:記下真正送出去的那一份 —— 已簽章、已放行、第幾次嘗試。
+
+> **0.2.0 的順序剛好相反。** 它依「簽章 → 限流 → 重試 → 日誌」掛上,註解描述的卻是另一回事,結果是重試帶著過期的時間戳出去、而且不付權重。順序錯了不會有任何錯誤訊息,只會在執行期表現成難以理解的行為,所以 0.3.0 用「在舊順序下會變紅」的測試把順序鎖住。詳見 [CHANGELOG](CHANGELOG.md)。
 
 ```csharp
 services.AddSingleton(TimeProvider.System);
+
+var timeouts = new HttpTimeoutOptions
+{
+    AttemptTimeout = TimeSpan.FromSeconds(10),
+    OverallTimeout = TimeSpan.FromSeconds(30),
+};
 
 services.AddHttpClient("exchange", client => client.BaseAddress = new Uri("https://api.example.com"))
     .AddOzakboyHttpPipeline(options =>
@@ -45,17 +53,32 @@ services.AddHttpClient("exchange", client => client.BaseAddress = new Uri("https
         options.Signing.ApiKey = configuration["Exchange:ApiKey"]!;
         options.Signing.SecretKey = configuration["Exchange:SecretKey"]!;
         options.Signing.ApiKeyHeaderName = "X-MBX-APIKEY";
+        options.Signing.TimestampParameterName = "timestamp";   // 每次嘗試都重新蓋時間戳
 
         options.RateLimiting.Buckets.Add(new RateLimitBucket("minute", 2400, TimeSpan.FromMinutes(1)));
         options.RateLimiting.Buckets.Add(new RateLimitBucket("second", 300, TimeSpan.FromSeconds(1)));
 
         options.Retry.Policy = RetryPolicy.Default;
-        options.Timeouts.AttemptTimeout = TimeSpan.FromSeconds(10);
-        options.Timeouts.OverallTimeout = TimeSpan.FromSeconds(30);
+        options.Timeouts.AttemptTimeout = timeouts.AttemptTimeout;
+        options.Timeouts.OverallTimeout = timeouts.OverallTimeout;
     });
+
+services.AddSingleton(provider => new HttpPipelineClient(
+    provider.GetRequiredService<IHttpClientFactory>().CreateClient("exchange"),
+    timeouts,
+    provider.GetService<TimeProvider>(),
+    provider.GetOzakboyHttpMasker("exchange")));   // 認得這個用戶端祕密的那一個遮罩器
 ```
 
-每一段也可以單獨註冊:`AddRequestSigning`、`AddWeightedRateLimiting`、`AddRetry`、`AddSanitizedLogging`。
+### `AddOzakboyHttpPipeline` 對用戶端做了什麼
+
+除了掛上四個處理器,它還對這個具名用戶端改了三件事:
+
+- **登記祕密。** `Signing.ApiKey`、`Signing.SecretKey` 與 `options.KnownSecrets` 裡的每個值,都登記到這個用戶端專屬的遮罩器 —— 以用戶端名稱為鍵的單例,`IHttpClientFactory` 重建處理器也不會遺失。執行期才取得的祕密,用 `provider.GetOzakboyHttpMasker("exchange").RegisterKnownSecret(value)` 登記到同一個遮罩器。
+- **移除 `IHttpClientFactory` 預設的日誌**(`RemoveAllLoggers()`)。那組日誌在 Information 層級寫出完整位址,而 .NET 只遮 query、不遮路徑 —— 憑證放在路徑裡的服務(例如 Telegram 的 `/bot<token>/`)就直接寫進日誌了。本套件自己的日誌處理器已經過遮罩,取代它們。
+- **把 `HttpClient.Timeout` 設為無限。** 逾時交給管線:重試處理器管單次嘗試,`HttpPipelineClient` 管整趟。預設的 100 秒若短於 `OverallTimeout`,會先觸發並表現成取消,逾時就被錯歸為「呼叫端取消」。先前自行設定的 `Timeout` 會被覆蓋。
+
+每一段也可以單獨註冊 —— `AddRetry`、`AddRequestSigning`、`AddWeightedRateLimiting`、`AddSanitizedLogging`,請照這個順序掛上;分段註冊時,順序正確與否由你負責。
 
 ---
 
@@ -134,6 +157,8 @@ HTTP 送出 GET https://api.example.com/fapi/v1/order?symbol=BTCUSDT&apiKey=vmPU
 
 **遮罩失敗時整段捨棄,絕不原樣輸出。** 這裡若 fail-open,等於把憑證直接寫進日誌,而且畫面上一切看起來都正常。
 
+**例外物件本身永遠不會交給記錄器,也不會放進 `Error`。** 連線層例外的訊息常帶著請求位址,而例外物件是遮不了的:`Message` 唯讀、內層例外鏈改不動。所以記錄器拿到的是 `SanitizedException` —— 原始型別名稱、遮罩後的訊息、遮罩後含堆疊的 `ToString()` —— 本套件產生的每一個 `Error.Exception` 也是它,`Error.Message` 與 `Error.Data` 則經過同一道字面替換。欄位名規則碰不到路徑段與例外訊息,只有登記過的值攔得住,這就是管線會替你登記簽章金鑰、以及 `KnownSecrets` 存在的原因。
+
 ---
 
 ## 失敗一律回傳 `Result<T>`
@@ -158,11 +183,13 @@ if (!result.TryGetValue(out var body))
 
 不走門面、直接用 `HttpClient` 的呼叫端,攔的是 `Ozakboy.Core.Abstractions` 的 `ResultException`。它是 Ozakboy 各套件共用的那一個載具,專門在「簽章由 BCL 決定、`Result<T>` 過不去」的邊界上攜帶 `Error`;`Error` 屬性保證非 null,型別繼承自 `InvalidOperationException`。要攔的例外只有這一種,不會每個套件各一種。
 
+它的 `InnerException` 和 `Error.Exception` 一樣是 `SanitizedException`,不會是原始型別:請以 `Error.Code` 與 `Error.Category` 分支,不要看例外型別。另外,建立 `HttpPipelineClient` 時請傳入用戶端的遮罩器(`GetOzakboyHttpMasker`)—— 它是錯誤離開本套件前的最後一道關口,沒傳的話,那道關口只認得 `SecretMasker.Default` 上的祕密。
+
 ---
 
 ## 測試
 
-`dotnet test` 跑 188 個測試,全程不連網、沒有任何 `Thread.Sleep`。簽章以幣安官方文件公佈的黃金向量鎖死,另有反證測試證明參數順序與編碼順序確實會改變結果。限流與重試的時間行為跑在 `FakeTimeProvider` 上。
+`dotnet test` 跑 208 個測試,全程不連網、沒有任何 `Thread.Sleep`。管線順序由「在 0.2.0 順序下會變紅」的測試鎖住;另有一個可辨識的假祕密走過所有失敗路徑,檢查每一種日誌形式與回傳錯誤的每一個欄位。簽章以幣安官方文件公佈的黃金向量鎖死,另有反證測試證明參數順序與編碼順序確實會改變結果。限流與重試的時間行為跑在 `FakeTimeProvider` 上。
 
 ---
 

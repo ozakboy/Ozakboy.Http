@@ -1,4 +1,5 @@
 using Ozakboy.Core.Abstractions;
+using Ozakboy.Security.Masking;
 
 namespace Ozakboy.Http;
 
@@ -24,12 +25,24 @@ namespace Ozakboy.Http;
 /// status means is the caller's call, since services differ widely in how they use the same code. To treat
 /// non-2xx as failure directly, use <see cref="SendForStringAsync"/>.
 /// </para>
+/// <para>
+/// <b>這裡是錯誤離開本套件前的最後一道關口。</b>回傳的每一個失敗都經過遮罩:代碼、訊息、每一筆資料都做已登記祕密的
+/// 字面替換,<see cref="Error.Exception"/> 一律換成 <see cref="SanitizedException"/>。遮罩用的是建構時傳入的遮罩器;
+/// 請傳入具名用戶端的那一個(<see cref="OzakboyHttpServiceProviderExtensions.GetOzakboyHttpMasker"/>),
+/// 否則這道關口只認得 <see cref="SecretMasker.Default"/> 上的祕密。
+/// <b>This is the last checkpoint errors pass before leaving the package.</b> Every failure returned is masked:
+/// the code, the message and every data entry get literal replacement of registered secrets, and
+/// <see cref="Error.Exception"/> is always a <see cref="SanitizedException"/>. The masker is the one supplied
+/// at construction; pass the named client's (<see cref="OzakboyHttpServiceProviderExtensions.GetOzakboyHttpMasker"/>),
+/// or this checkpoint knows only the secrets on <see cref="SecretMasker.Default"/>.
+/// </para>
 /// </remarks>
 public sealed class HttpPipelineClient
 {
     private readonly HttpClient _httpClient;
     private readonly HttpTimeoutOptions _timeouts;
     private readonly TimeProvider _timeProvider;
+    private readonly SecretMasker _masker;
 
     /// <summary>
     /// 建立門面。
@@ -49,6 +62,34 @@ public sealed class HttpPipelineClient
     /// 逾時設定不合法時擲出。Thrown when the timeout options are invalid.
     /// </exception>
     public HttpPipelineClient(HttpClient httpClient, HttpTimeoutOptions? timeouts = null, TimeProvider? timeProvider = null)
+        : this(httpClient, timeouts, timeProvider, null)
+    {
+    }
+
+    /// <summary>
+    /// 建立門面,並指定錯誤邊界使用的遮罩器。
+    /// Creates the facade with the masker its error boundary uses.
+    /// </summary>
+    /// <param name="httpClient">
+    /// 已組好管線的用戶端。通常來自 <see cref="IHttpClientFactory"/>。
+    /// The client with the pipeline already assembled, usually from <see cref="IHttpClientFactory"/>.
+    /// </param>
+    /// <param name="timeouts">逾時設定;<see langword="null"/> 時使用預設值。The timeout options; defaults are used when <see langword="null"/>.</param>
+    /// <param name="timeProvider">時間來源;測試請傳入假時鐘。The time source; tests pass a fake clock.</param>
+    /// <param name="masker">
+    /// 遮罩器,通常是 <see cref="OzakboyHttpServiceProviderExtensions.GetOzakboyHttpMasker"/> 取得的那一個;
+    /// <see langword="null"/> 時使用 <see cref="SecretMasker.Default"/>。
+    /// The masker, usually the one from <see cref="OzakboyHttpServiceProviderExtensions.GetOzakboyHttpMasker"/>;
+    /// <see cref="SecretMasker.Default"/> when <see langword="null"/>.
+    /// </param>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="httpClient"/> 為 <see langword="null"/> 時擲出。
+    /// Thrown when <paramref name="httpClient"/> is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// 逾時設定不合法時擲出。Thrown when the timeout options are invalid.
+    /// </exception>
+    public HttpPipelineClient(HttpClient httpClient, HttpTimeoutOptions? timeouts, TimeProvider? timeProvider, SecretMasker? masker)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
 
@@ -62,6 +103,7 @@ public sealed class HttpPipelineClient
         _httpClient = httpClient;
         _timeouts = effectiveTimeouts;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _masker = masker ?? SecretMasker.Default;
     }
 
     /// <summary>
@@ -88,16 +130,17 @@ public sealed class HttpPipelineClient
         }
         catch (ResultException exception)
         {
-            return Result.Failure<HttpResponseMessage>(exception.Error);
+            return Result.Failure<HttpResponseMessage>(ErrorSanitizer.Sanitize(exception.Error, _masker));
         }
         catch (HttpRequestException exception)
         {
-            return Result.Failure<HttpResponseMessage>(HttpErrorMapper.FromException(exception));
+            return Result.Failure<HttpResponseMessage>(HttpErrorMapper.FromException(exception, _masker));
         }
         catch (OperationCanceledException exception)
         {
-            return Result.Failure<HttpResponseMessage>(
-                DescribeCancellation(exception, timeoutSource, _timeouts.OverallTimeout, cancellationToken));
+            return Result.Failure<HttpResponseMessage>(ErrorSanitizer.Sanitize(
+                DescribeCancellation(exception, timeoutSource, _timeouts.OverallTimeout, cancellationToken),
+                _masker));
         }
     }
 
@@ -136,7 +179,10 @@ public sealed class HttpPipelineClient
                 // 之後就沒有第二次機會讀那個標頭了。
                 // The Retry-After instruction comes along with the error: the caller receives a Result, the
                 // response is disposed by then, and there is no second chance to read that header.
-                return HttpErrorMapper.WithRetryAfter(error, response, _timeProvider);
+                // 回應內容摘要也在錯誤資料裡,對方可能把金鑰 echo 回來 —— 一樣過邊界遮罩。
+                // The body snippet sits in the error data too, and a peer may echo the key back in it, so it goes
+                // through the boundary masking as well.
+                return ErrorSanitizer.Sanitize(HttpErrorMapper.WithRetryAfter(error, response, _timeProvider), _masker);
             }
 
             try
@@ -145,11 +191,11 @@ public sealed class HttpPipelineClient
             }
             catch (HttpRequestException exception)
             {
-                return HttpErrorMapper.FromException(exception);
+                return HttpErrorMapper.FromException(exception, _masker);
             }
             catch (OperationCanceledException exception)
             {
-                return HttpErrorMapper.FromException(exception);
+                return HttpErrorMapper.FromException(exception, _masker);
             }
         }
     }

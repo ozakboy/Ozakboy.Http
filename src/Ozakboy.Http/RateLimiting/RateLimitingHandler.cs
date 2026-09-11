@@ -8,10 +8,30 @@ namespace Ozakboy.Http.RateLimiting;
 /// never leaves the machine.
 /// </summary>
 /// <remarks>
-/// 位置在簽章之後、重試之前。放在重試外層是刻意的:每一次重試都應該各自付出自己的權重,
-/// 否則重試風暴會在對方的配額上炸開,換來更長的封鎖。
-/// It sits after signing and before retry. Being outside the retry handler is deliberate: each retry should
-/// pay its own weight, otherwise a retry storm blows through the peer's quota and earns a longer ban.
+/// <para>
+/// <b>位置在重試之內。</b><see cref="System.Net.Http.IHttpClientFactory"/> 的管線是「先註冊的在外層」,
+/// 重試處理器在外層時,每一次嘗試都會重新穿過這裡,各自付出自己的權重 —— 這才對得上對方的算法:
+/// 幣安這類服務以實際收到的請求計算權重,超過就回 418 封鎖位址。錯誤率一高,重試就是實打實的額外權重。
+/// <b>It sits inside retry.</b> The <see cref="System.Net.Http.IHttpClientFactory"/> pipeline puts the
+/// first-registered handler outermost, so with retry outside, every attempt passes through here again and pays
+/// its own weight. That matches the peer's arithmetic: services such as Binance count the requests they actually
+/// receive and answer 418 — an address ban — past the limit, and when the error rate climbs, retries are very
+/// real extra weight.
+/// </para>
+/// <para>
+/// 0.2.0 的註解寫著「放在重試外層,每次重試各自付權重」,推理剛好相反:外層只會被穿過一次,
+/// 同一個請求重試 N 次只付一份權重,本地配額因此低估了實際用量。
+/// The 0.2.0 comment read "outside retry, so each retry pays its own weight", which is exactly backwards:
+/// an outer handler is traversed once, so a request retried N times paid for one, and the local quota
+/// under-counted real usage.
+/// </para>
+/// <para>
+/// 重試的退避等待發生在外層的重試處理器裡,那時這裡的閘門早已釋放,不持有任何許可;
+/// 權杖桶的權重是「取走」而不是「借用」,所以也沒有要歸還的東西。
+/// Retry backoff happens in the outer retry handler, by which time this handler's gate has long been released
+/// and nothing is held; token-bucket weight is taken rather than borrowed, so there is nothing to give back
+/// either.
+/// </para>
 /// </remarks>
 public sealed class RateLimitingHandler : DelegatingHandler
 {

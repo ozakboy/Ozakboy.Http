@@ -204,7 +204,12 @@ public sealed class WeightedRateLimiter : IDisposable
     private static Result Cancelled(OperationCanceledException exception) =>
         new Error(HttpErrorCodes.Cancelled, "等待限流額度時被取消。Cancelled while waiting for rate-limit permits.", ErrorCategory.Cancelled)
         {
-            Exception = exception,
+            // 本套件產生的錯誤一律不帶原始例外物件(見 SanitizedException)。這裡拿不到用戶端的遮罩器,
+            // 先以預設遮罩器替換;錯誤離開管線時,邊界會再以用戶端的遮罩器遮一次。
+            // Errors from this package never carry the original exception object (see SanitizedException).
+            // The client's masker is not reachable here, so the default one is used; the boundary masks again
+            // with the client's masker when the error leaves the pipeline.
+            Exception = ErrorSanitizer.Sanitize(exception, Ozakboy.Security.Masking.SecretMasker.Default),
         };
 
     private void ReplenishDueBuckets(DateTimeOffset now)

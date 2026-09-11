@@ -27,17 +27,25 @@ This package does those four things on top of the official `HttpClientFactory` a
 Four handlers, and **the order matters**:
 
 ```
-signing → rate limiting → retry → sanitising logging → the network
+retry → signing → rate limiting → sanitising logging → the network
 ```
 
-Getting it wrong produces no error at all, only behaviour that is hard to read at runtime:
+The rule behind it is that **every attempt is a new request**. Retry sits outermost, so the other three run again on every attempt:
 
-- **Signing inside retry** re-signs on every attempt with a fresh timestamp. Some services reject that outright.
-- **Rate limiting inside retry** means a retry storm consumes no weight, and blows through the peer's quota.
-- **Logging anywhere but innermost** records what the caller intended to send rather than what actually went out.
+- **Signing inside retry.** Every attempt is re-signed, and with `Signing.TimestampParameterName` set, restamped with the current time. A retry that reused the first attempt's timestamp would be rejected by the peer's time window after a long backoff (Binance `-1021`).
+- **Rate limiting inside retry.** Every attempt pays its own weight. Outside retry, a request retried N times would pay once, and the local quota would under-count exactly when the error rate is high — which is when a weight-based ban (418) arrives. The backoff wait happens outside the limiter and holds no permit.
+- **Logging innermost.** It records what actually went out: signed, admitted, and which attempt it was.
+
+> **0.2.0 had this backwards.** It attached signing → rate limiting → retry → logging while its comments described the opposite, so retries reused a stale timestamp and paid no weight. A wrong order raises no error, only hard-to-read runtime behaviour, so 0.3.0 pins the order with tests that go red under the old one. See the [changelog](CHANGELOG.md).
 
 ```csharp
 services.AddSingleton(TimeProvider.System);
+
+var timeouts = new HttpTimeoutOptions
+{
+    AttemptTimeout = TimeSpan.FromSeconds(10),
+    OverallTimeout = TimeSpan.FromSeconds(30),
+};
 
 services.AddHttpClient("exchange", client => client.BaseAddress = new Uri("https://api.example.com"))
     .AddOzakboyHttpPipeline(options =>
@@ -45,17 +53,32 @@ services.AddHttpClient("exchange", client => client.BaseAddress = new Uri("https
         options.Signing.ApiKey = configuration["Exchange:ApiKey"]!;
         options.Signing.SecretKey = configuration["Exchange:SecretKey"]!;
         options.Signing.ApiKeyHeaderName = "X-MBX-APIKEY";
+        options.Signing.TimestampParameterName = "timestamp";   // restamped on every attempt
 
         options.RateLimiting.Buckets.Add(new RateLimitBucket("minute", 2400, TimeSpan.FromMinutes(1)));
         options.RateLimiting.Buckets.Add(new RateLimitBucket("second", 300, TimeSpan.FromSeconds(1)));
 
         options.Retry.Policy = RetryPolicy.Default;
-        options.Timeouts.AttemptTimeout = TimeSpan.FromSeconds(10);
-        options.Timeouts.OverallTimeout = TimeSpan.FromSeconds(30);
+        options.Timeouts.AttemptTimeout = timeouts.AttemptTimeout;
+        options.Timeouts.OverallTimeout = timeouts.OverallTimeout;
     });
+
+services.AddSingleton(provider => new HttpPipelineClient(
+    provider.GetRequiredService<IHttpClientFactory>().CreateClient("exchange"),
+    timeouts,
+    provider.GetService<TimeProvider>(),
+    provider.GetOzakboyHttpMasker("exchange")));   // the masker that knows this client's secrets
 ```
 
-Each section can also be registered on its own: `AddRequestSigning`, `AddWeightedRateLimiting`, `AddRetry`, `AddSanitizedLogging`.
+### What `AddOzakboyHttpPipeline` does to the client
+
+Besides attaching the four handlers, it changes three things on the named client:
+
+- **It registers secrets.** `Signing.ApiKey`, `Signing.SecretKey`, and every value in `options.KnownSecrets` go onto a masker that belongs to this client — a singleton keyed by client name, so it survives `IHttpClientFactory` rebuilding its handlers. A secret that only turns up at run time goes onto the same masker with `provider.GetOzakboyHttpMasker("exchange").RegisterKnownSecret(value)`.
+- **It removes `IHttpClientFactory`'s default logging** (`RemoveAllLoggers()`). That logging writes the full URI at Information level, and .NET redacts the query, not the path — a credential in the path, like Telegram's `/bot<token>/`, goes straight into the log. The pipeline's own logging handler is masked and replaces it.
+- **It sets `HttpClient.Timeout` to infinite.** Timeouts belong to the pipeline: the retry handler bounds each attempt, `HttpPipelineClient` the whole exchange. The default 100 seconds, if shorter than `OverallTimeout`, would fire first as a cancellation, and a timeout would be misfiled as the caller cancelling. Any `Timeout` configured earlier is overridden.
+
+Each section can also be registered on its own — `AddRetry`, `AddRequestSigning`, `AddWeightedRateLimiting`, `AddSanitizedLogging` — in that order. Getting the order right is then your job.
 
 ---
 
@@ -134,6 +157,8 @@ Masking is `Ozakboy.Security`'s `SecretMasker`, whose default name list already 
 
 **If masking fails, the value is discarded — never emitted raw.** Fail-open here would write the credential straight into the log while everything still looked fine.
 
+**Exceptions never reach a logger, or an `Error`, as themselves.** A transport exception's message often carries the request URI, and an exception object cannot be masked: `Message` is read-only and the inner chain cannot be rewritten. So the logger receives a `SanitizedException` instead — the original type name, the masked message, and the masked `ToString()` with its stack — and every `Error.Exception` this package produces is one too, with `Error.Message` and `Error.Data` passed through the same replacement. Name rules cannot reach a path segment or an exception message; only registered values can, which is why the pipeline registers the signing keys for you and `KnownSecrets` exists.
+
 ---
 
 ## Failures come back as `Result<T>`
@@ -158,11 +183,13 @@ Diagnostic values travel in `Error.Data` under the keys in `HttpErrorDataKeys`, 
 
 Callers who use a bare `HttpClient` instead of the facade catch `ResultException` from `Ozakboy.Core.Abstractions`. It is the one carrier every Ozakboy package uses to move an `Error` across a boundary whose signature belongs to the BCL, its `Error` property is never null, and it derives from `InvalidOperationException` — so there is a single exception type to catch rather than one per package.
 
+Its `InnerException`, like `Error.Exception`, is a `SanitizedException`, never the original type: branch on `Error.Code` and `Error.Category` rather than on exception types. And give `HttpPipelineClient` the client's masker (`GetOzakboyHttpMasker`), since it is the last checkpoint an error passes on its way out; without it, that checkpoint only knows the secrets on `SecretMasker.Default`.
+
 ---
 
 ## Testing
 
-`dotnet test` runs 188 tests with no network and no `Thread.Sleep`. Signing is pinned to golden vectors published in the Binance documentation, with counter-proofs that parameter order and encoding order really do change the result. Rate limiting and retry timing run on `FakeTimeProvider`.
+`dotnet test` runs 208 tests with no network and no `Thread.Sleep`. The pipeline order is pinned by tests that go red under the 0.2.0 order, and a canary secret is walked through the failure paths to check every log form and every field of the returned error. Signing is pinned to golden vectors published in the Binance documentation, with counter-proofs that parameter order and encoding order really do change the result. Rate limiting and retry timing run on `FakeTimeProvider`.
 
 ---
 

@@ -11,6 +11,7 @@
 
     <PackageProjectUrl>https://github.com/ozakboy/Ozakboy.Http</PackageProjectUrl>
     <RepositoryUrl>https://github.com/ozakboy/Ozakboy.Http</RepositoryUrl>
+    <PackageReleaseNotes>0.3.0: pipeline order fixed to retry, signing, rate limiting, logging (0.2.0 had it the other way round, contradicting its own comments), so every attempt is re-signed with a fresh timestamp and pays its own rate-limit weight. Exceptions are never handed to the logger or placed in Error unmasked (SanitizedException). AddOzakboyHttpPipeline registers the signing keys and HttpPipelineOptions.KnownSecrets on a per-client masker, removes IHttpClientFactory's default logging, and sets HttpClient.Timeout to infinite. See https://github.com/ozakboy/Ozakboy.Http/blob/main/CHANGELOG.md</PackageReleaseNotes>
 
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
   </PropertyGroup>

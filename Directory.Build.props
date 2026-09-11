@@ -24,7 +24,7 @@
 
   <!-- 版號(SemVer)。發版時只改這裡。 -->
   <PropertyGroup>
-    <VersionPrefix>0.2.0</VersionPrefix>
+    <VersionPrefix>0.3.0</VersionPrefix>
   </PropertyGroup>
 
   <!-- 靜態分析:自研套件多,更需要編譯期把關 -->

@@ -59,8 +59,10 @@ public sealed class PipelineIntegrationTests
         Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
         Assert.AreEqual(2, stub.CallCount);
 
-        // 簽章在管線最外層,兩次嘗試送出的是同一份已簽字串。
-        // Signing sits outermost, so both attempts carry the same signed string.
+        // 每次嘗試都重新簽章。這裡沒有設定 TimestampParameterName,參數完全相同,重新算出的簽章也就逐字相同;
+        // 時間戳會變的情境見 PipelineOrderTests。
+        // Every attempt is re-signed. No TimestampParameterName is configured here, so the parameters are
+        // identical and so is the recomputed signature; the changing-timestamp case lives in PipelineOrderTests.
         Assert.AreEqual(stub.Requests[0].RequestUri, stub.Requests[1].RequestUri);
         Assert.IsTrue(stub.Requests[0].RequestUri!.Query.Contains("signature=", StringComparison.Ordinal));
         Assert.AreEqual(ApiKey, stub.Requests[1].Headers["X-API-Key"]);

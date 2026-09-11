@@ -123,6 +123,42 @@ public sealed class QueryParameters
     }
 
     /// <summary>
+    /// 把指定名稱的參數值換掉,位置不變;不存在時附加在尾端。回傳新的實例;原實例不變。
+    /// Replaces the value of the named parameter in place, or appends it when absent. Returns a new instance;
+    /// the original is unchanged.
+    /// </summary>
+    /// <param name="name">參數名,以序數比對。The parameter name, compared ordinally.</param>
+    /// <param name="value">新的值。The new value.</param>
+    /// <returns>替換後的新實例。A new instance with the value replaced.</returns>
+    /// <remarks>
+    /// 「位置不變」是重點:參數順序就是簽章順序,呼叫端把時間戳放在哪裡,重新蓋上的時間戳就必須還在那裡,
+    /// 否則對方依文件順序重算的簽章會對不上。
+    /// Keeping the position is the point: parameter order is signing order, so a refreshed timestamp must sit
+    /// exactly where the caller put the original one, or a peer recomputing the signature in documented order
+    /// would not match.
+    /// </remarks>
+    internal QueryParameters WithValue(string name, string value)
+    {
+        var replaced = new KeyValuePair<string, string>[_items.Length];
+        var found = false;
+
+        for (var i = 0; i < _items.Length; i++)
+        {
+            if (string.Equals(_items[i].Key, name, StringComparison.Ordinal))
+            {
+                replaced[i] = new KeyValuePair<string, string>(name, value);
+                found = true;
+            }
+            else
+            {
+                replaced[i] = _items[i];
+            }
+        }
+
+        return found ? new QueryParameters(replaced) : Append(name, value);
+    }
+
+    /// <summary>
     /// 回傳已編碼的 query 字串,與 <see cref="ToQueryString"/> 相同。
     /// Returns the encoded query string, identical to <see cref="ToQueryString"/>.
     /// </summary>

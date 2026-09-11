@@ -1,6 +1,7 @@
 using System.Globalization;
 using Microsoft.Extensions.Options;
 using Ozakboy.Core.Abstractions;
+using Ozakboy.Security.Masking;
 
 namespace Ozakboy.Http.Retry;
 
@@ -28,16 +29,36 @@ namespace Ozakboy.Http.Retry;
 /// Backoff comes from <see cref="RetryPolicy.GetDelay(int)"/>; when the response carries <c>Retry-After</c>,
 /// the peer's instruction wins instead, capped by <see cref="RetryOptions.MaxRetryAfter"/>.
 /// </para>
+/// <para>
+/// <b>位置在管線最外層。</b>簽章、限流、日誌都在它之內,所以每一次嘗試都會重新簽章(新的時間戳)、重新付權重、
+/// 各自留下一筆日誌。退避等待發生在這一層,那時內層的限流器不持有任何許可。0.2.0 把它放在簽章與限流之內,
+/// 重試因此沿用舊的時間戳、也不付權重,見 <see cref="OzakboyHttpClientBuilderExtensions"/>。
+/// <b>It sits outermost in the pipeline.</b> Signing, rate limiting and logging are all inside it, so every
+/// attempt is re-signed with a fresh timestamp, pays its own weight, and leaves its own log line. Backoff waits
+/// happen at this level, while the inner limiter holds no permit. In 0.2.0 it sat inside signing and rate
+/// limiting, so retries reused the old timestamp and paid no weight; see
+/// <see cref="OzakboyHttpClientBuilderExtensions"/>.
+/// </para>
+/// <para>
+/// 單次嘗試逾時涵蓋整個內層,包括等待限流許可的時間。等待許可時逾時會回報為
+/// <see cref="HttpErrorCodes.AttemptTimeout"/>,而不是限流器看到的「取消」—— 呼叫端並沒有取消。
+/// 本處理器產生的錯誤不攜帶原始例外物件,一律換成 <see cref="SanitizedException"/>。
+/// The per-attempt timeout covers everything inside, including the wait for rate-limit permits. Timing out
+/// during that wait is reported as <see cref="HttpErrorCodes.AttemptTimeout"/> rather than the cancellation the
+/// limiter sees — the caller cancelled nothing. Errors raised here never carry the original exception object;
+/// it is always swapped for a <see cref="SanitizedException"/>.
+/// </para>
 /// </remarks>
 public sealed class RetryHandler : DelegatingHandler
 {
     private readonly RetryOptions _options;
     private readonly HttpTimeoutOptions _timeouts;
     private readonly TimeProvider _timeProvider;
+    private readonly SecretMasker _masker;
 
     /// <summary>
-    /// 建立重試處理器。
-    /// Creates the retry handler.
+    /// 建立重試處理器,錯誤以 <see cref="SecretMasker.Default"/> 遮罩。
+    /// Creates the retry handler, masking errors with <see cref="SecretMasker.Default"/>.
     /// </summary>
     /// <param name="options">重試設定。The retry options.</param>
     /// <param name="timeouts">逾時設定;<see langword="null"/> 時使用預設值。The timeout options; defaults are used when <see langword="null"/>.</param>
@@ -50,6 +71,29 @@ public sealed class RetryHandler : DelegatingHandler
     /// 設定不合法時擲出。Thrown when the options are invalid.
     /// </exception>
     public RetryHandler(RetryOptions options, HttpTimeoutOptions? timeouts = null, TimeProvider? timeProvider = null)
+        : this(options, timeouts, timeProvider, null)
+    {
+    }
+
+    /// <summary>
+    /// 建立重試處理器,錯誤以指定的遮罩器遮罩。
+    /// Creates the retry handler, masking errors with the given masker.
+    /// </summary>
+    /// <param name="options">重試設定。The retry options.</param>
+    /// <param name="timeouts">逾時設定;<see langword="null"/> 時使用預設值。The timeout options; defaults are used when <see langword="null"/>.</param>
+    /// <param name="timeProvider">時間來源;測試請傳入假時鐘。The time source; tests pass a fake clock.</param>
+    /// <param name="masker">
+    /// 遮罩器;<see langword="null"/> 時使用 <see cref="SecretMasker.Default"/>。
+    /// The masker; <see cref="SecretMasker.Default"/> when <see langword="null"/>.
+    /// </param>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="options"/> 為 <see langword="null"/> 時擲出。
+    /// Thrown when <paramref name="options"/> is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// 設定不合法時擲出。Thrown when the options are invalid.
+    /// </exception>
+    public RetryHandler(RetryOptions options, HttpTimeoutOptions? timeouts, TimeProvider? timeProvider, SecretMasker? masker)
     {
         ArgumentNullException.ThrowIfNull(options);
 
@@ -69,6 +113,7 @@ public sealed class RetryHandler : DelegatingHandler
         _options = options;
         _timeouts = effectiveTimeouts;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _masker = masker ?? SecretMasker.Default;
     }
 
     /// <summary>
@@ -176,7 +221,7 @@ public sealed class RetryHandler : DelegatingHandler
                     {
                         if (IsWorthRetrying(policy, exception.Error))
                         {
-                            throw Exhaust(exception.Error, attempt).ToException();
+                            throw Exhaust(ErrorSanitizer.Sanitize(exception.Error, _masker), attempt).ToException();
                         }
 
                         throw;
@@ -184,7 +229,7 @@ public sealed class RetryHandler : DelegatingHandler
                 }
                 catch (HttpRequestException exception)
                 {
-                    var error = HttpErrorMapper.FromException(exception);
+                    var error = HttpErrorMapper.FromException(exception, _masker);
                     if (!policy.ShouldRetry(attempt, error))
                     {
                         if (IsWorthRetrying(policy, error))
@@ -240,9 +285,10 @@ public sealed class RetryHandler : DelegatingHandler
     /// <see langword="false"/>, which is precisely "it could have worked, but the attempts are spent".
     /// </para>
     /// <para>
-    /// 代碼、訊息、內層例外與既有資料一律保留 —— 綁在 <see cref="HttpErrorCodes"/> 上分支的呼叫端不受影響,
-    /// 變的只有分類與多出來的 <see cref="HttpErrorDataKeys.Attempts"/>。
-    /// The code, message, inner exception, and existing data are all kept, so callers branching on
+    /// 代碼、訊息、內層例外(已是遮罩後的 <see cref="SanitizedException"/>)與既有資料一律保留 ——
+    /// 綁在 <see cref="HttpErrorCodes"/> 上分支的呼叫端不受影響,變的只有分類與多出來的 <see cref="HttpErrorDataKeys.Attempts"/>。
+    /// The code, message, inner exception (already a masked <see cref="SanitizedException"/>), and existing data
+    /// are all kept, so callers branching on
     /// <see cref="HttpErrorCodes"/> are unaffected; only the category changes, plus the added
     /// <see cref="HttpErrorDataKeys.Attempts"/> entry.
     /// </para>
@@ -275,13 +321,30 @@ public sealed class RetryHandler : DelegatingHandler
         }
         catch (OperationCanceledException exception) when (timeoutSource.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
-            throw new Error(
-                HttpErrorCodes.AttemptTimeout,
-                $"單次嘗試超過 {_timeouts.AttemptTimeout} 未完成。A single attempt did not complete within {_timeouts.AttemptTimeout}.",
-                ErrorCategory.Timeout)
-            {
-                Exception = exception,
-            }.ToException();
+            throw AttemptTimedOut(exception).ToException();
+        }
+        catch (ResultException exception) when (
+            exception.Error.Category == ErrorCategory.Cancelled
+            && timeoutSource.IsCancellationRequested
+            && !cancellationToken.IsCancellationRequested)
+        {
+            // 限流在重試之內,單次嘗試逾時因此也涵蓋等待許可的時間。限流器看到的是權杖被取消,
+            // 回報的是「取消」;但呼叫端什麼都沒取消,是這次嘗試的時間用完了。不改標的話,
+            // 呼叫端會把它當成使用者取消 —— 既不重試、也不告警。
+            // Rate limiting sits inside retry, so the attempt timeout also covers the wait for permits. The
+            // limiter sees its token cancelled and reports a cancellation, but the caller cancelled nothing:
+            // this attempt ran out of time. Left unrelabelled, the caller would treat it as a user cancellation —
+            // neither retried nor alerted on.
+            throw AttemptTimedOut(exception).ToException();
         }
     }
+
+    private Error AttemptTimedOut(Exception cause) =>
+        new(
+            HttpErrorCodes.AttemptTimeout,
+            $"單次嘗試超過 {_timeouts.AttemptTimeout} 未完成。A single attempt did not complete within {_timeouts.AttemptTimeout}.",
+            ErrorCategory.Timeout)
+        {
+            Exception = ErrorSanitizer.Sanitize(cause, _masker),
+        };
 }

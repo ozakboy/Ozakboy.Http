@@ -452,7 +452,13 @@ public sealed class RetryHandlerTests
             "機會用掉了就不再是暫時性的,否則呼叫端的重試層會把同一個故障再乘一輪。Once the attempts are spent it is no longer transient, or the caller's own retry layer multiplies the same fault by another round.");
         Assert.IsTrue(exception.Error.TryGetInt64(HttpErrorDataKeys.Attempts, out var attempts));
         Assert.AreEqual(3L, attempts);
-        Assert.IsInstanceOfType<HttpRequestException>(exception.InnerException);
+        // 0.3.0 起錯誤不再攜帶原始例外物件,內層例外是遮罩後的替身,原始型別名稱仍在。
+        // Since 0.3.0 errors no longer carry the original object: the inner exception is the masked stand-in,
+        // with the original type name kept.
+        Assert.IsInstanceOfType<SanitizedException>(exception.InnerException);
+        Assert.AreEqual(
+            typeof(HttpRequestException).FullName,
+            ((SanitizedException)exception.InnerException!).OriginalExceptionType);
         Assert.AreEqual(3, stub.CallCount);
     }
 
