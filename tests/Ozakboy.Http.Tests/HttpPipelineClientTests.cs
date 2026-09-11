@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Headers;
 using Ozakboy.Http.Tests.TestSupport;
 
 namespace Ozakboy.Http.Tests;
@@ -42,7 +43,7 @@ public sealed class HttpPipelineClientTests
     public async Task SendAsync_PipelineFailure_BecomesAFailedResult()
     {
         var stub = new StubHttpMessageHandler((_, _, _) =>
-            throw new HttpPipelineException(Error.RateLimited(HttpErrorCodes.RateLimitTimeout, "排不到額度。No permits.")));
+            throw Error.RateLimited(HttpErrorCodes.RateLimitTimeout, "排不到額度。No permits.").ToException());
 
         using var httpClient = new HttpClient(stub);
         var client = new HttpPipelineClient(httpClient, LongTimeouts());
@@ -144,6 +145,37 @@ public sealed class HttpPipelineClientTests
         Assert.IsTrue(result.IsFailure);
         Assert.AreEqual(ErrorCategory.RateLimited, result.Error!.Category);
         Assert.IsTrue(result.Error!.IsTransient);
+    }
+
+    [TestMethod]
+    public async Task SendForStringAsync_RateLimited_CarriesTheStatusAndRetryAfterIntoTheError()
+    {
+        // 回應在這個方法裡就被釋放了,呼叫端只拿得到 Result。狀態碼與 Retry-After 若沒在這時候
+        // 寫進錯誤,之後就再也讀不到 —— 而這兩個正是下游最需要用程式判斷的數值。
+        // The response is disposed inside this method and the caller only ever sees a Result. If the status
+        // and Retry-After are not written into the error here they are gone for good — and those two are
+        // exactly what downstream code needs to branch on.
+        var stub = new StubHttpMessageHandler((_, _, _) =>
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.TooManyRequests)
+            {
+                Content = new StringContent("slow down"),
+            };
+            response.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromSeconds(30));
+            return Task.FromResult(response);
+        });
+
+        using var httpClient = new HttpClient(stub);
+        var client = new HttpPipelineClient(httpClient, LongTimeouts());
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, "https://example.test/api");
+        var result = await client.SendForStringAsync(request, CancellationToken.None);
+
+        Assert.IsTrue(result.IsFailure);
+        Assert.IsTrue(result.Error!.TryGetInt64(HttpErrorDataKeys.StatusCode, out var statusCode));
+        Assert.AreEqual(429L, statusCode);
+        Assert.IsTrue(result.Error!.TryGetDecimal(HttpErrorDataKeys.RetryAfterSeconds, out var seconds));
+        Assert.AreEqual(30m, seconds);
     }
 
     [TestMethod]

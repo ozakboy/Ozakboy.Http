@@ -106,6 +106,18 @@ Making it an explicit declaration is deliberate. With a boolean, the default `fa
 
 Backoff comes from `RetryPolicy.GetDelay`. When a response carries `Retry-After`, the peer's instruction wins instead (capped by `MaxRetryAfter`) — the server knows how much of its cooldown remains, and coming back early only extends the ban.
 
+Whether a failure is worth retrying is decided entirely by the policy. Setting `RetryPolicy.RetryPredicate` replaces the built-in transient check outright — not as an extra condition — and the error it is handed already carries what such a decision needs:
+
+```csharp
+var policy = RetryPolicy.Default with
+{
+    // A 429 that says when to come back is worth another go; one that does not usually means the address is banned.
+    RetryPredicate = error => error.TryGetDecimal(HttpErrorDataKeys.RetryAfterSeconds, out _),
+};
+```
+
+When the attempts run out on a failure that *was* worth retrying, the error handed back is re-labelled `ErrorCategory.Exhausted`: the code and message are kept, but `IsTransient` turns false, so the caller's own retry layer does not multiply the same fault by another round.
+
 Timeouts come in two layers: `AttemptTimeout` bounds one attempt, `OverallTimeout` bounds the whole exchange including backoff waits.
 
 ---
@@ -142,11 +154,15 @@ if (!result.TryGetValue(out var body))
 
 `HttpErrorMapper` does the classification: 429 is `RateLimited`, 408 is `Timeout`, every 5xx is `Unavailable` — all transient. Other 4xx codes are not: the request itself is wrong, and resending it unchanged earns the same answer plus another slice of quota. A caller cancellation maps to `Cancelled`, which is not transient — it deserves neither a retry nor an alert.
 
+Diagnostic values travel in `Error.Data` under the keys in `HttpErrorDataKeys`, and they read back typed: `error.TryGetInt64(HttpErrorDataKeys.StatusCode, out var status)` and `error.TryGetDecimal(HttpErrorDataKeys.RetryAfterSeconds, out var seconds)`. Nothing has to be parsed back out of a string at the far end, and no consumer gets the chance to forget `InvariantCulture`.
+
+Callers who use a bare `HttpClient` instead of the facade catch `ResultException` from `Ozakboy.Core.Abstractions`. It is the one carrier every Ozakboy package uses to move an `Error` across a boundary whose signature belongs to the BCL, its `Error` property is never null, and it derives from `InvalidOperationException` — so there is a single exception type to catch rather than one per package.
+
 ---
 
 ## Testing
 
-`dotnet test` runs 180 tests with no network and no `Thread.Sleep`. Signing is pinned to golden vectors published in the Binance documentation, with counter-proofs that parameter order and encoding order really do change the result. Rate limiting and retry timing run on `FakeTimeProvider`.
+`dotnet test` runs 188 tests with no network and no `Thread.Sleep`. Signing is pinned to golden vectors published in the Binance documentation, with counter-proofs that parameter order and encoding order really do change the result. Rate limiting and retry timing run on `FakeTimeProvider`.
 
 ---
 

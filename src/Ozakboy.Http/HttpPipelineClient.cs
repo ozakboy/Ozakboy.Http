@@ -86,7 +86,7 @@ public sealed class HttpPipelineClient
         {
             return await _httpClient.SendAsync(request, linked.Token).ConfigureAwait(false);
         }
-        catch (HttpPipelineException exception)
+        catch (ResultException exception)
         {
             return Result.Failure<HttpResponseMessage>(exception.Error);
         }
@@ -112,19 +112,31 @@ public sealed class HttpPipelineClient
     /// The response body on success; a failure on transport problems or a non-2xx status, with a category that
     /// already says whether retrying is worthwhile.
     /// </returns>
-    public async Task<Result<string>> SendForStringAsync(HttpRequestMessage request, CancellationToken cancellationToken = default)
-    {
-        var result = await SendAsync(request, cancellationToken).ConfigureAwait(false);
-        if (!result.TryGetValue(out var response))
-        {
-            return result.ToFailure<string>();
-        }
+    /// <remarks>
+    /// 「送出」與「讀內容」是兩個各自可能失敗的步驟,以 <see cref="ResultExtensions.ThenAsync{T, TOut}(Task{Result{T}}, Func{T, Task{Result{TOut}}})"/>
+    /// 串接:第一步失敗就短路,錯誤原封不動往下傳,不必在這裡手動判斷再轉發一次。
+    /// Sending and reading are two steps that can each fail, chained with
+    /// <see cref="ResultExtensions.ThenAsync{T, TOut}(Task{Result{T}}, Func{T, Task{Result{TOut}}})"/>: a
+    /// failure in the first short-circuits and travels on untouched, with no hand-written check-and-forward
+    /// in between.
+    /// </remarks>
+    public Task<Result<string>> SendForStringAsync(HttpRequestMessage request, CancellationToken cancellationToken = default) =>
+        SendAsync(request, cancellationToken)
+            .ThenAsync(response => ReadBodyAsync(response, cancellationToken));
 
+    private async Task<Result<string>> ReadBodyAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
         using (response)
         {
             if (!response.IsSuccessStatusCode)
             {
-                return await HttpErrorMapper.FromResponseAsync(response, cancellationToken: cancellationToken).ConfigureAwait(false);
+                var error = await HttpErrorMapper.FromResponseAsync(response, cancellationToken: cancellationToken).ConfigureAwait(false);
+
+                // Retry-After 一併帶進錯誤:呼叫端拿到的是 Result,回應這時已經被釋放,
+                // 之後就沒有第二次機會讀那個標頭了。
+                // The Retry-After instruction comes along with the error: the caller receives a Result, the
+                // response is disposed by then, and there is no second chance to read that header.
+                return HttpErrorMapper.WithRetryAfter(error, response, _timeProvider);
             }
 
             try

@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Headers;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -53,7 +54,7 @@ public sealed class EdgeCaseTests
         using var request = new HttpRequestMessage { Method = HttpMethod.Get, RequestUri = null };
         request.WithSignature();
 
-        var exception = await Assert.ThrowsExactlyAsync<HttpPipelineException>(
+        var exception = await Assert.ThrowsExactlyAsync<ResultException>(
             () => invoker.SendAsync(request, CancellationToken.None));
 
         Assert.AreEqual(HttpErrorCodes.SigningMissingRequestUri, exception.Error.Code);
@@ -202,38 +203,62 @@ public sealed class EdgeCaseTests
     }
 
     [TestMethod]
-    public void HttpPipelineException_StandardConstructors_CarryAnError()
+    public void HttpErrorMapper_StatusError_CarriesTheStatusCodeAsANumber()
     {
-        var parameterless = new HttpPipelineException();
-        Assert.IsNotNull(parameterless.Error);
+        // 狀態碼是下游最想用程式讀回去的東西,存成數值才不必每個消費端各寫一次 Parse。
+        // The status code is what downstream code most wants to read back, and storing it as a number spares
+        // every consumer from writing its own parse.
+        var error = HttpErrorMapper.FromStatusCode(HttpStatusCode.TooManyRequests, "Too Many Requests", "{\"code\":-1003}");
 
-        var withMessage = new HttpPipelineException("壞了。Broken.");
-        Assert.AreEqual("壞了。Broken.", withMessage.Error.Message);
-
-        var inner = new InvalidOperationException("inner");
-        var withInner = new HttpPipelineException("外層。Outer.", inner);
-        Assert.AreSame(inner, withInner.InnerException);
-        Assert.AreSame(inner, withInner.Error.Exception);
-
-        var blankMessage = new HttpPipelineException("   ");
-        Assert.IsFalse(string.IsNullOrWhiteSpace(blankMessage.Error.Message));
+        Assert.IsTrue(error.TryGetInt64(HttpErrorDataKeys.StatusCode, out var statusCode));
+        Assert.AreEqual(429L, statusCode);
+        Assert.IsTrue(error.TryGetData(HttpErrorDataKeys.Body, out var body));
+        Assert.AreEqual("{\"code\":-1003}", body);
+        Assert.AreEqual(ErrorCategory.RateLimited, error.Category);
     }
 
     [TestMethod]
-    public void HttpPipelineException_NullError_Throws() =>
-        Assert.ThrowsExactly<ArgumentNullException>(() => new HttpPipelineException((Error)null!));
+    public void HttpErrorMapper_NoBodySnippet_OmitsTheBodyEntry()
+    {
+        var error = HttpErrorMapper.FromStatusCode(HttpStatusCode.BadRequest);
+
+        Assert.IsTrue(error.TryGetInt64(HttpErrorDataKeys.StatusCode, out var statusCode));
+        Assert.AreEqual(400L, statusCode);
+        Assert.IsFalse(error.TryGetData(HttpErrorDataKeys.Body, out _));
+    }
 
     [TestMethod]
-    public void HttpPipelineException_CarriesTheErrorAndItsException()
+    public void HttpErrorMapper_WithRetryAfter_CarriesTheDelayAsANumber()
     {
-        var cause = new HttpRequestException("cause");
-        var error = Error.FromException(cause, HttpErrorCodes.Network, ErrorCategory.Network);
+        var clock = new FakeTimeProvider();
+        using var response = new HttpResponseMessage(HttpStatusCode.TooManyRequests);
+        response.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromSeconds(90));
 
-        var exception = new HttpPipelineException(error);
+        var error = HttpErrorMapper.WithRetryAfter(
+            HttpErrorMapper.FromStatusCode(HttpStatusCode.TooManyRequests),
+            response,
+            clock);
 
-        Assert.AreSame(error, exception.Error);
-        Assert.AreSame(cause, exception.InnerException);
-        StringAssert.Contains(exception.Message, HttpErrorCodes.Network);
+        Assert.IsTrue(error.TryGetDecimal(HttpErrorDataKeys.RetryAfterSeconds, out var seconds));
+        Assert.AreEqual(90m, seconds);
+
+        // 原有的資料不能被蓋掉:附加一筆不等於重建一份。
+        // The existing entries must survive: adding one is not rebuilding the set.
+        Assert.IsTrue(error.TryGetInt64(HttpErrorDataKeys.StatusCode, out var statusCode));
+        Assert.AreEqual(429L, statusCode);
+    }
+
+    [TestMethod]
+    public void HttpErrorMapper_WithRetryAfter_WithoutTheHeader_LeavesTheErrorAlone()
+    {
+        var clock = new FakeTimeProvider();
+        using var response = new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
+        var original = HttpErrorMapper.FromStatusCode(HttpStatusCode.ServiceUnavailable);
+
+        var error = HttpErrorMapper.WithRetryAfter(original, response, clock);
+
+        Assert.AreSame(original, error);
+        Assert.IsFalse(error.TryGetDecimal(HttpErrorDataKeys.RetryAfterSeconds, out _));
     }
 
     [TestMethod]

@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Ozakboy.Core.Abstractions;
 using Ozakboy.Security.Masking;
 
 namespace Ozakboy.Http.Logging;
@@ -133,7 +134,7 @@ public sealed partial class SanitizingLoggingHandler : DelegatingHandler
 
             return response;
         }
-        catch (HttpPipelineException exception)
+        catch (ResultException exception)
         {
             LogRequestFailed(_logger, method, uri, (long)_timeProvider.GetElapsedTime(start).TotalMilliseconds, exception);
             throw;

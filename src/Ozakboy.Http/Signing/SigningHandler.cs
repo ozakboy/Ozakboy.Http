@@ -90,7 +90,7 @@ public sealed class SigningHandler : DelegatingHandler
             var signature = _options.Algorithm.Sign(canonical, _options.SecretKey);
             if (!signature.TryGetValue(out var value))
             {
-                throw new HttpPipelineException(signature.Error!);
+                throw signature.Error!.ToException();
             }
 
             // 簽章參數本身也要編碼,而且必須接在待簽字串「之後」——
@@ -147,9 +147,9 @@ public sealed class SigningHandler : DelegatingHandler
     {
         if (uri is null)
         {
-            throw new HttpPipelineException(Error.Validation(
+            throw Error.Validation(
                 HttpErrorCodes.SigningMissingRequestUri,
-                "請求沒有目標位址,無法附加參數。The request has no target URI, so parameters cannot be attached."));
+                "請求沒有目標位址,無法附加參數。The request has no target URI, so parameters cannot be attached.").ToException();
         }
 
         var text = uri.IsAbsoluteUri ? uri.GetLeftPart(UriPartial.Path) : uri.OriginalString;

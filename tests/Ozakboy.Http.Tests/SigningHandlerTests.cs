@@ -157,7 +157,7 @@ public sealed class SigningHandlerTests
 
         using var request = new HttpRequestMessage(HttpMethod.Get, "https://example.test/api").WithSignature();
 
-        var exception = await Assert.ThrowsExactlyAsync<HttpPipelineException>(
+        var exception = await Assert.ThrowsExactlyAsync<ResultException>(
             () => client.SendAsync(request, CancellationToken.None));
 
         Assert.AreEqual(HttpErrorCodes.SigningSecretMissing, exception.Error.Code);

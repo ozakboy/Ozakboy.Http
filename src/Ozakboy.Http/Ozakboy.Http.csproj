@@ -40,7 +40,7 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.12" />
     <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.12" />
     <PackageReference Include="System.Threading.RateLimiting" Version="10.0.12" />
-    <PackageReference Include="Ozakboy.Core.Abstractions" Version="0.2.1" />
+    <PackageReference Include="Ozakboy.Core.Abstractions" Version="0.3.0" />
     <PackageReference Include="Ozakboy.Security" Version="0.1.1" />
   </ItemGroup>
 

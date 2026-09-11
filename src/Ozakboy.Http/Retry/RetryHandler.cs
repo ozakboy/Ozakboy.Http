@@ -1,3 +1,4 @@
+using System.Globalization;
 using Microsoft.Extensions.Options;
 using Ozakboy.Core.Abstractions;
 
@@ -129,8 +130,6 @@ public sealed class RetryHandler : DelegatingHandler
             // throws outright.
             using (var attemptRequest = HttpRequestCloner.Clone(request, contentBytes))
             {
-                Error error;
-
                 try
                 {
                     var response = await SendAttemptAsync(attemptRequest, cancellationToken).ConfigureAwait(false);
@@ -139,33 +138,60 @@ public sealed class RetryHandler : DelegatingHandler
                         return response;
                     }
 
-                    error = _options.ErrorBodySnippetLength > 0
+                    var mapped = _options.ErrorBodySnippetLength > 0
                         ? await HttpErrorMapper.FromResponseAsync(response, _options.ErrorBodySnippetLength, cancellationToken).ConfigureAwait(false)
                         : HttpErrorMapper.FromStatusCode(response.StatusCode, response.ReasonPhrase);
 
+                    // Retry-After 先寫進錯誤,再問策略。順序是重點:策略的 RetryPredicate 只看得到 Error,
+                    // 而「這個 429 帶不帶 Retry-After」正是呼叫端最想用來分辨「稍後再來」與「位址被封」的依據。
+                    // 先寫進去,那個判斷才寫得進策略裡,不必在這個處理器中另開一層規則。
+                    // The Retry-After instruction goes into the error before the policy is asked, and the
+                    // order is the point: a RetryPredicate only ever sees an Error, and whether a 429 carries
+                    // Retry-After is exactly what tells "come back later" from "this address is banned".
+                    // Writing it in first is what lets that judgement live in the policy instead of growing a
+                    // second layer of rules in this handler.
+                    var error = HttpErrorMapper.WithRetryAfter(mapped, response, _timeProvider);
+
                     if (!policy.ShouldRetry(attempt, error))
                     {
+                        // 次數用盡也照樣把回應交還出去 —— 真實的狀態碼與內容比一個合成的錯誤有用,
+                        // 而「這是不是最後一次」由呼叫端自己的重試層去判斷。
+                        // The response goes back even when the attempts are spent: the real status and body
+                        // are worth more than a synthesised error, and whether this was the last word is for
+                        // the caller's own retry layer to decide.
                         return response;
                     }
 
-                    if (_options.RespectRetryAfter && HttpErrorMapper.TryGetRetryAfter(response, _timeProvider, out var after))
+                    if (_options.RespectRetryAfter && error.TryGetDecimal(HttpErrorDataKeys.RetryAfterSeconds, out var seconds))
                     {
+                        var after = TimeSpan.FromSeconds((double)seconds);
                         retryAfter = after > _options.MaxRetryAfter ? _options.MaxRetryAfter : after;
                     }
 
                     response.Dispose();
                 }
-                catch (HttpPipelineException exception)
+                catch (ResultException exception)
                 {
                     if (!policy.ShouldRetry(attempt, exception.Error))
                     {
+                        if (IsWorthRetrying(policy, exception.Error))
+                        {
+                            throw Exhaust(exception.Error, attempt).ToException();
+                        }
+
                         throw;
                     }
                 }
                 catch (HttpRequestException exception)
                 {
-                    if (!policy.ShouldRetry(attempt, HttpErrorMapper.FromException(exception)))
+                    var error = HttpErrorMapper.FromException(exception);
+                    if (!policy.ShouldRetry(attempt, error))
                     {
+                        if (IsWorthRetrying(policy, error))
+                        {
+                            throw Exhaust(error, attempt).ToException();
+                        }
+
                         throw;
                     }
                 }
@@ -178,6 +204,59 @@ public sealed class RetryHandler : DelegatingHandler
             }
         }
     }
+
+    /// <summary>
+    /// 問同一份策略「這個錯誤本身值不值得重試」,與次數無關。
+    /// Asks the same policy whether this error is worth retrying at all, independent of the attempt count.
+    /// </summary>
+    /// <remarks>
+    /// 刻意以 <c>attempt = 1</c> 呼叫 <see cref="RetryPolicy.ShouldRetry(int, Error)"/>,而不是在這裡照抄一份
+    /// 「<see cref="RetryPolicy.RetryPredicate"/> 有就用它、沒有就看 <see cref="Error.IsTransient"/>」的規則:
+    /// 走到這裡時 <see cref="RetryPolicy.MaxAttempts"/> 必定大於 1(否則早就走了不重試的分支),
+    /// 因此答案只反映錯誤本身。抄一份規則就會有兩個真相來源,而策略那邊改了這裡不會有人發現。
+    /// This deliberately calls <see cref="RetryPolicy.ShouldRetry(int, Error)"/> with <c>attempt = 1</c>
+    /// rather than restating the "use <see cref="RetryPolicy.RetryPredicate"/> if set, otherwise
+    /// <see cref="Error.IsTransient"/>" rule here. By this point <see cref="RetryPolicy.MaxAttempts"/> is
+    /// necessarily above 1 — the no-retry branch was taken otherwise — so the answer reflects only the error.
+    /// A copied rule would be a second source of truth, and a change on the policy side would go unnoticed here.
+    /// </remarks>
+    private static bool IsWorthRetrying(RetryPolicy policy, Error error) => policy.ShouldRetry(1, error);
+
+    /// <summary>
+    /// 把「值得重試但次數已經用盡」的錯誤改標為 <see cref="ErrorCategory.Exhausted"/>。
+    /// Re-labels an error that was worth retrying but ran out of attempts as
+    /// <see cref="ErrorCategory.Exhausted"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 原本的分類(逾時、連線失敗)是暫時性的,交回給呼叫端時就等於說「再試一次可能會過」——
+    /// 但我們已經替它試過了。呼叫端的重試層看到暫時性就再跑一輪,於是同一個故障被乘上兩層次數。
+    /// <see cref="ErrorCategory.Exhausted"/> 的 <see cref="Error.IsTransient"/> 為 <see langword="false"/>,
+    /// 正是「原本可行,但機會已用盡」這句話。
+    /// The original category — a timeout, a dropped connection — is transient, and handing it back says
+    /// "another attempt might work"; but the attempts have already been made. A caller's own retry layer sees
+    /// transient and runs another round, multiplying one fault by two layers of attempt counts.
+    /// <see cref="ErrorCategory.Exhausted"/> reports <see cref="Error.IsTransient"/> as
+    /// <see langword="false"/>, which is precisely "it could have worked, but the attempts are spent".
+    /// </para>
+    /// <para>
+    /// 代碼、訊息、內層例外與既有資料一律保留 —— 綁在 <see cref="HttpErrorCodes"/> 上分支的呼叫端不受影響,
+    /// 變的只有分類與多出來的 <see cref="HttpErrorDataKeys.Attempts"/>。
+    /// The code, message, inner exception, and existing data are all kept, so callers branching on
+    /// <see cref="HttpErrorCodes"/> are unaffected; only the category changes, plus the added
+    /// <see cref="HttpErrorDataKeys.Attempts"/> entry.
+    /// </para>
+    /// </remarks>
+    private static Error Exhaust(Error error, int attempts) =>
+        (Error.Exhausted(
+            error.Code,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{error.Message}(已嘗試 {attempts} 次仍失敗,不再重試。Gave up after {attempts} attempts.)")) with
+        {
+            Exception = error.Exception,
+            Data = error.Data,
+        }).WithData(HttpErrorDataKeys.Attempts, attempts);
 
     private static bool IsSafeMethod(HttpMethod method) =>
         method == HttpMethod.Get
@@ -196,14 +275,13 @@ public sealed class RetryHandler : DelegatingHandler
         }
         catch (OperationCanceledException exception) when (timeoutSource.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
-            throw new HttpPipelineException(
-                new Error(
-                    HttpErrorCodes.AttemptTimeout,
-                    $"單次嘗試超過 {_timeouts.AttemptTimeout} 未完成。A single attempt did not complete within {_timeouts.AttemptTimeout}.",
-                    ErrorCategory.Timeout)
-                {
-                    Exception = exception,
-                });
+            throw new Error(
+                HttpErrorCodes.AttemptTimeout,
+                $"單次嘗試超過 {_timeouts.AttemptTimeout} 未完成。A single attempt did not complete within {_timeouts.AttemptTimeout}.",
+                ErrorCategory.Timeout)
+            {
+                Exception = exception,
+            }.ToException();
         }
     }
 }

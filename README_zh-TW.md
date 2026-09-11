@@ -106,6 +106,18 @@ using var request = new HttpRequestMessage(HttpMethod.Post, "/fapi/v1/order")
 
 退避間隔由 `RetryPolicy.GetDelay` 計算。回應若帶 `Retry-After`,以對方指定的時間為準(上限為 `MaxRetryAfter`)—— 伺服器知道自己的封鎖窗口還剩多長,提早重送只會把封鎖時間延長。
 
+「值不值得重試」完全由策略決定。設了 `RetryPolicy.RetryPredicate` 就是**取代**內建的暫時性判斷,不是再加一個條件;而傳進去的錯誤上已經備齊做這個判斷所需要的資料:
+
+```csharp
+var policy = RetryPolicy.Default with
+{
+    // 會說「什麼時候再來」的 429 值得再試一次;不說的那種,通常是位址被封了。
+    RetryPredicate = error => error.TryGetDecimal(HttpErrorDataKeys.RetryAfterSeconds, out _),
+};
+```
+
+本來值得重試、但次數已經用盡的失敗,交回去時會改標成 `ErrorCategory.Exhausted`:代碼與訊息保留,但 `IsTransient` 變成 false —— 呼叫端自己的重試層才不會把同一個故障再乘一輪。
+
 逾時分兩層:`AttemptTimeout` 管單次嘗試,`OverallTimeout` 管含退避等待在內的整趟請求。
 
 ---
@@ -142,11 +154,15 @@ if (!result.TryGetValue(out var body))
 
 分類由 `HttpErrorMapper` 負責:429 是 `RateLimited`、408 是 `Timeout`、所有 5xx 是 `Unavailable`,這三類都是暫時性的。其餘 4xx 不是:請求本身有問題,原封不動重送只會得到同一個答案,還多消耗一次配額。呼叫端主動取消對映成 `Cancelled`,不是暫時性 —— 它既不該被重試也不該告警。
 
+診斷資料放在 `Error.Data`,鍵名集中在 `HttpErrorDataKeys`,而且讀回來是有型別的:`error.TryGetInt64(HttpErrorDataKeys.StatusCode, out var status)`、`error.TryGetDecimal(HttpErrorDataKeys.RetryAfterSeconds, out var seconds)`。下游不必把字串再 parse 回數值,也就沒有機會漏掉 `InvariantCulture`。
+
+不走門面、直接用 `HttpClient` 的呼叫端,攔的是 `Ozakboy.Core.Abstractions` 的 `ResultException`。它是 Ozakboy 各套件共用的那一個載具,專門在「簽章由 BCL 決定、`Result<T>` 過不去」的邊界上攜帶 `Error`;`Error` 屬性保證非 null,型別繼承自 `InvalidOperationException`。要攔的例外只有這一種,不會每個套件各一種。
+
 ---
 
 ## 測試
 
-`dotnet test` 跑 180 個測試,全程不連網、沒有任何 `Thread.Sleep`。簽章以幣安官方文件公佈的黃金向量鎖死,另有反證測試證明參數順序與編碼順序確實會改變結果。限流與重試的時間行為跑在 `FakeTimeProvider` 上。
+`dotnet test` 跑 188 個測試,全程不連網、沒有任何 `Thread.Sleep`。簽章以幣安官方文件公佈的黃金向量鎖死,另有反證測試證明參數順序與編碼順序確實會改變結果。限流與重試的時間行為跑在 `FakeTimeProvider` 上。
 
 ---
 

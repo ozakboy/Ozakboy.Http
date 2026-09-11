@@ -71,7 +71,7 @@ public sealed class RateLimitingHandlerTests
         using var firstResponse = await client.SendAsync(first, CancellationToken.None);
 
         using var second = new HttpRequestMessage(HttpMethod.Get, "https://example.test/api");
-        var exception = await Assert.ThrowsExactlyAsync<HttpPipelineException>(
+        var exception = await Assert.ThrowsExactlyAsync<ResultException>(
             () => client.SendAsync(second, CancellationToken.None));
 
         Assert.AreEqual(HttpErrorCodes.RateLimitTimeout, exception.Error.Code);

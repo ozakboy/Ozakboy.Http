@@ -54,20 +54,17 @@ public static class HttpErrorMapper
             ? string.Create(CultureInfo.InvariantCulture, $"HTTP {code}。HTTP {code}.")
             : string.Create(CultureInfo.InvariantCulture, $"HTTP {code} {reasonPhrase}");
 
-        var data = new Dictionary<string, string>(StringComparer.Ordinal)
-        {
-            ["statusCode"] = code.ToString(CultureInfo.InvariantCulture),
-        };
+        // statusCode 存成數值型:下游想分支「這是不是 5xx」時應該拿得到數字,而不是拿到字串再自己
+        // Parse 回去 —— 每個消費端各寫一次 Parse,就是每個消費端各有一次漏掉 InvariantCulture 的機會。
+        // The status code is stored as a number: a consumer branching on "is this a 5xx" should get a number
+        // back rather than a string to re-parse — every consumer that parses is another chance to forget
+        // InvariantCulture.
+        var error = new Error(HttpErrorCodes.ForStatus(statusCode), message, category)
+            .WithData(HttpErrorDataKeys.StatusCode, code);
 
-        if (!string.IsNullOrWhiteSpace(bodySnippet))
-        {
-            data["body"] = bodySnippet;
-        }
-
-        return new Error(HttpErrorCodes.ForStatus(statusCode), message, category)
-        {
-            Data = data,
-        };
+        return string.IsNullOrWhiteSpace(bodySnippet)
+            ? error
+            : error.WithData(HttpErrorDataKeys.Body, bodySnippet);
     }
 
     /// <summary>
@@ -191,5 +188,51 @@ public static class HttpErrorMapper
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// 把回應的 <c>Retry-After</c> 指示寫進錯誤資料;沒有指示時原樣回傳。
+    /// Writes the response's <c>Retry-After</c> instruction into the error's data, or returns it unchanged
+    /// when there is none.
+    /// </summary>
+    /// <param name="error">來源錯誤。The source error.</param>
+    /// <param name="response">回應。The response.</param>
+    /// <param name="timeProvider">時間來源。The time source.</param>
+    /// <returns>
+    /// 帶有 <see cref="HttpErrorDataKeys.RetryAfterSeconds"/> 的新錯誤,或原錯誤。
+    /// A new error carrying <see cref="HttpErrorDataKeys.RetryAfterSeconds"/>, or the original error.
+    /// </returns>
+    /// <remarks>
+    /// <para>
+    /// 這一步是為了讓「值不值得重試」這個判斷能完全留在 <see cref="RetryPolicy"/> 裡。
+    /// 同樣是 429,帶著 <c>Retry-After</c> 的通常是「稍後再來」,不帶的那種往往是位址被封;
+    /// 但 <see cref="RetryPolicy.RetryPredicate"/> 只看得到 <see cref="Error"/>,看不到回應物件。
+    /// 把指示搬進錯誤資料之後,呼叫端才寫得出 <c>e.TryGetDecimal(HttpErrorDataKeys.RetryAfterSeconds, out _)</c>
+    /// 這種判斷,而不必在處理器裡另開一層自己的規則。
+    /// This step is what keeps the "is it worth retrying" judgement entirely inside the
+    /// <see cref="RetryPolicy"/>. Of two 429s, the one carrying <c>Retry-After</c> usually means "come back
+    /// later" while the one without often means the address is banned — but
+    /// <see cref="RetryPolicy.RetryPredicate"/> only ever sees an <see cref="Error"/>, never the response.
+    /// With the instruction moved into the error's data, a caller can write
+    /// <c>e.TryGetDecimal(HttpErrorDataKeys.RetryAfterSeconds, out _)</c> instead of growing a second layer of
+    /// rules inside a handler.
+    /// </para>
+    /// <para>
+    /// 存的是對方說的秒數,不套任何本地上限;上限屬於處置決定,見
+    /// <see cref="HttpErrorDataKeys.RetryAfterSeconds"/>。
+    /// The value stored is the peer's own figure with no local ceiling applied; the ceiling is a handling
+    /// decision, as noted on <see cref="HttpErrorDataKeys.RetryAfterSeconds"/>.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">
+    /// 任一參數為 <see langword="null"/> 時擲出。Thrown when any argument is <see langword="null"/>.
+    /// </exception>
+    public static Error WithRetryAfter(Error error, HttpResponseMessage response, TimeProvider timeProvider)
+    {
+        ArgumentNullException.ThrowIfNull(error);
+
+        return TryGetRetryAfter(response, timeProvider, out var delay)
+            ? error.WithData(HttpErrorDataKeys.RetryAfterSeconds, (decimal)delay.TotalSeconds)
+            : error;
     }
 }
