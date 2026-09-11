@@ -1,0 +1,76 @@
+<Project>
+
+  <!--
+    套件 repo 統一建置設定。
+    版號、授權、分析器層級集中於此,各 csproj 只放自己專屬的 PackageId 與描述。
+  -->
+  <!--
+    先推導 IsTestProject。
+    這個屬性平常由測試 SDK 設定,但 Directory.Build.props 的匯入時機早於測試 SDK,
+    在這裡直接拿它當條件會永遠求值為空,底下的測試專案設定就完全不會生效。
+    因此以專案名稱慣例(*.Tests)自行推導一次;若呼叫端已明確指定則尊重原值。
+  -->
+  <PropertyGroup>
+    <IsTestProject Condition="'$(IsTestProject)' == '' AND $(MSBuildProjectName.EndsWith('.Tests'))">true</IsTestProject>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!-- 版號(SemVer)。發版時只改這裡。 -->
+  <PropertyGroup>
+    <VersionPrefix>0.1.0</VersionPrefix>
+  </PropertyGroup>
+
+  <!-- 靜態分析:自研套件多,更需要編譯期把關 -->
+  <PropertyGroup Condition="'$(IsTestProject)' != 'true'">
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest-all</AnalysisLevel>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <Features>strict</Features>
+  </PropertyGroup>
+
+  <!-- 測試專案:保留分析器但不因警告中斷,避免測試樣板碼被規則卡住 -->
+  <PropertyGroup Condition="'$(IsTestProject)' == 'true'">
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <IsPackable>false</IsPackable>
+    <!--
+      CA1707:測試方法慣用 Method_Scenario_Expected 的底線命名,可讀性優於 PascalCase 長字串。
+      MSTEST0037:建議改用 Assert.IsLessThanOrEqualTo 這類專用 API;但那些多載無法附帶自訂失敗訊息,
+                  而測試失敗時的訊息比斷言方法的名稱更有價值,故不強制。
+    -->
+    <NoWarn>$(NoWarn);CA1707;MSTEST0037</NoWarn>
+  </PropertyGroup>
+
+  <!-- 套件中繼資料(共用部分) -->
+  <PropertyGroup>
+    <Authors>ozakboy</Authors>
+    <Company>ozakboy</Company>
+    <Copyright>Copyright (c) 2026 ozakboy</Copyright>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <!-- ozakboy 套件家族共用的品牌圖示,顯示於 nuget.org 與 IDE 的套件管理員 -->
+    <PackageIcon>logo.png</PackageIcon>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+
+  <!-- 可重現建置與符號檔 -->
+  <PropertyGroup>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+</Project>

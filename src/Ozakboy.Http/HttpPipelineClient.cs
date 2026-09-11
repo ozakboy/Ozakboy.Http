@@ -1,0 +1,174 @@
+using Ozakboy.Core.Abstractions;
+
+namespace Ozakboy.Http;
+
+/// <summary>
+/// 管線的對外門面:把例外路徑收斂回 <see cref="Result{T}"/>,並施加整體逾時。
+/// The pipeline's outward facade: it folds the exception path back into <see cref="Result{T}"/> and applies
+/// the overall timeout.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <see cref="HttpClient"/> 以例外表達失敗,本套件以 <see cref="Result{T}"/> 表達 —— 轉換就發生在這裡。
+/// 呼叫端因此不必記得哪些例外要攔、哪些是預期的失敗,所有結果都是同一種形狀。
+/// <see cref="HttpClient"/> reports failures as exceptions and this package reports them as
+/// <see cref="Result{T}"/>; the conversion happens here. Callers therefore need not remember which exceptions
+/// to catch and which failures are expected — every outcome has the same shape.
+/// </para>
+/// <para>
+/// <b>非 2xx 回應不算失敗。</b><see cref="SendAsync"/> 只在「請求沒送出去或沒拿到回應」時回傳失敗;
+/// 拿到 4xx 仍算成功取得回應,狀態碼怎麼解讀由呼叫端決定(不同服務對同一個狀態碼的用法差很多)。
+/// 想直接把非 2xx 當失敗處理,用 <see cref="SendForStringAsync"/>。
+/// <b>A non-2xx response is not a failure.</b> <see cref="SendAsync"/> reports failure only when the request
+/// never went out or no response came back; a 4xx still counts as having obtained a response, and what the
+/// status means is the caller's call, since services differ widely in how they use the same code. To treat
+/// non-2xx as failure directly, use <see cref="SendForStringAsync"/>.
+/// </para>
+/// </remarks>
+public sealed class HttpPipelineClient
+{
+    private readonly HttpClient _httpClient;
+    private readonly HttpTimeoutOptions _timeouts;
+    private readonly TimeProvider _timeProvider;
+
+    /// <summary>
+    /// 建立門面。
+    /// Creates the facade.
+    /// </summary>
+    /// <param name="httpClient">
+    /// 已組好管線的用戶端。通常來自 <see cref="IHttpClientFactory"/>。
+    /// The client with the pipeline already assembled, usually from <see cref="IHttpClientFactory"/>.
+    /// </param>
+    /// <param name="timeouts">逾時設定;<see langword="null"/> 時使用預設值。The timeout options; defaults are used when <see langword="null"/>.</param>
+    /// <param name="timeProvider">時間來源;測試請傳入假時鐘。The time source; tests pass a fake clock.</param>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="httpClient"/> 為 <see langword="null"/> 時擲出。
+    /// Thrown when <paramref name="httpClient"/> is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// 逾時設定不合法時擲出。Thrown when the timeout options are invalid.
+    /// </exception>
+    public HttpPipelineClient(HttpClient httpClient, HttpTimeoutOptions? timeouts = null, TimeProvider? timeProvider = null)
+    {
+        ArgumentNullException.ThrowIfNull(httpClient);
+
+        var effectiveTimeouts = timeouts ?? new HttpTimeoutOptions();
+        var validation = effectiveTimeouts.Validate();
+        if (validation.IsFailure)
+        {
+            throw new ArgumentException(validation.Error.Message, nameof(timeouts));
+        }
+
+        _httpClient = httpClient;
+        _timeouts = effectiveTimeouts;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+    }
+
+    /// <summary>
+    /// 送出請求並取得回應。
+    /// Sends the request and returns the response.
+    /// </summary>
+    /// <param name="request">請求。呼叫端負責釋放。The request; the caller disposes it.</param>
+    /// <param name="cancellationToken">取消權杖。The cancellation token.</param>
+    /// <returns>
+    /// 成功時為回應(呼叫端負責釋放);請求未送出或未取得回應時為失敗。
+    /// The response on success, which the caller disposes; a failure when the request never went out or no
+    /// response was obtained.
+    /// </returns>
+    public async Task<Result<HttpResponseMessage>> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        using var timeoutSource = new CancellationTokenSource(_timeouts.OverallTimeout, _timeProvider);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutSource.Token);
+
+        try
+        {
+            return await _httpClient.SendAsync(request, linked.Token).ConfigureAwait(false);
+        }
+        catch (HttpPipelineException exception)
+        {
+            return Result.Failure<HttpResponseMessage>(exception.Error);
+        }
+        catch (HttpRequestException exception)
+        {
+            return Result.Failure<HttpResponseMessage>(HttpErrorMapper.FromException(exception));
+        }
+        catch (OperationCanceledException exception)
+        {
+            return Result.Failure<HttpResponseMessage>(
+                DescribeCancellation(exception, timeoutSource, _timeouts.OverallTimeout, cancellationToken));
+        }
+    }
+
+    /// <summary>
+    /// 送出請求並讀回字串內容。非 2xx 回應視為失敗。
+    /// Sends the request and reads the body as a string. A non-2xx response counts as a failure.
+    /// </summary>
+    /// <param name="request">請求。呼叫端負責釋放。The request; the caller disposes it.</param>
+    /// <param name="cancellationToken">取消權杖。The cancellation token.</param>
+    /// <returns>
+    /// 成功時為回應內容;傳輸失敗或狀態碼非 2xx 時為失敗,錯誤分類已能反映是否值得重試。
+    /// The response body on success; a failure on transport problems or a non-2xx status, with a category that
+    /// already says whether retrying is worthwhile.
+    /// </returns>
+    public async Task<Result<string>> SendForStringAsync(HttpRequestMessage request, CancellationToken cancellationToken = default)
+    {
+        var result = await SendAsync(request, cancellationToken).ConfigureAwait(false);
+        if (!result.TryGetValue(out var response))
+        {
+            return result.ToFailure<string>();
+        }
+
+        using (response)
+        {
+            if (!response.IsSuccessStatusCode)
+            {
+                return await HttpErrorMapper.FromResponseAsync(response, cancellationToken: cancellationToken).ConfigureAwait(false);
+            }
+
+            try
+            {
+                return Result.Success(await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
+            }
+            catch (HttpRequestException exception)
+            {
+                return HttpErrorMapper.FromException(exception);
+            }
+            catch (OperationCanceledException exception)
+            {
+                return HttpErrorMapper.FromException(exception);
+            }
+        }
+    }
+
+    private static Error DescribeCancellation(
+        OperationCanceledException exception,
+        CancellationTokenSource timeoutSource,
+        TimeSpan overallTimeout,
+        CancellationToken callerToken)
+    {
+        // 呼叫端取消與整體逾時都是 OperationCanceledException,但意義完全不同:
+        // 前者不該重試也不該告警,後者是真正的故障訊號。用哪個權杖被觸發來分辨。
+        // A caller cancellation and an overall timeout are both OperationCanceledException but mean quite
+        // different things: the first deserves neither a retry nor an alert, the second is a genuine fault
+        // signal. Which token fired is what tells them apart.
+        if (callerToken.IsCancellationRequested)
+        {
+            return HttpErrorMapper.FromException(exception);
+        }
+
+        if (timeoutSource.IsCancellationRequested)
+        {
+            return new Error(
+                HttpErrorCodes.Timeout,
+                $"整趟請求(含重試)超過 {overallTimeout} 未完成。The exchange, retries included, did not complete within {overallTimeout}.",
+                ErrorCategory.Timeout)
+            {
+                Exception = exception,
+            };
+        }
+
+        return HttpErrorMapper.FromException(exception);
+    }
+}

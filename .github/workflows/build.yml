@@ -1,0 +1,42 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # SourceLink 需要完整歷史
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      # 本 repo 的測試專案走 Microsoft.Testing.Platform 而非舊的 VSTest(見 tests 的 csproj:
+      # VSTest 那條路徑會遞移帶進第三方的 Newtonsoft.Json,違反本專案的相依政策)。
+      # MTP 不認得 VSTest 的 --logger,產生 trx 的等效寫法是 --report-trx。
+      - name: Test
+        run: dotnet test --configuration Release --no-build --verbosity normal --report-trx --report-trx-filename test-results.trx
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: '**/TestResults/*.trx'
+          if-no-files-found: ignore

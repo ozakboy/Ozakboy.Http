@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Ozakboy.Http</PackageId>
+    <AssemblyName>Ozakboy.Http</AssemblyName>
+    <RootNamespace>Ozakboy.Http</RootNamespace>
+
+    <Title>Ozakboy.Http — 官方 HttpClientFactory 之上的簽章／限流／重試／脫敏日誌管線</Title>
+    <Description>建構在官方 HttpClientFactory 與 DelegatingHandler 之上的 HTTP 管線,取代 RestSharp / Flurl / Polly 這類第三方函式庫:順序固定的簽章、加權多桶限流、冪等感知重試與脫敏日誌四段處理器。簽章以有序參數容器杜絕字典列舉順序造成的隨機失敗,限流建於官方 System.Threading.RateLimiting 之上並以 TimeProvider 驅動,重試僅對安全方法或明確標記為冪等的請求生效並尊重 Retry-After。所有預期失敗以 Result&lt;T&gt; 表達而非例外。除 Microsoft 官方套件與 Ozakboy.* 自研套件外,零第三方相依。A signing, rate-limiting, retry, and log-masking DelegatingHandler pipeline built on the official HttpClientFactory, replacing third-party libraries such as RestSharp, Flurl, and Polly. Ordered query containers keep signatures deterministic, rate limiting is driven by TimeProvider for testability, retries apply only to safe or explicitly idempotent requests, and expected failures are returned as Result&lt;T&gt; rather than thrown.</Description>
+    <PackageTags>ozakboy;http;httpclient;httpclientfactory;delegatinghandler;hmac;hmac-sha256;signing;request-signing;rate-limit;rate-limiting;token-bucket;retry;backoff;idempotency;retry-after;logging;masking;redaction;timeprovider;result;trading;dotnet;csharp</PackageTags>
+
+    <PackageProjectUrl>https://github.com/ozakboy/Ozakboy.Http</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ozakboy/Ozakboy.Http</RepositoryUrl>
+
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!-- 內部輔助型別(請求複製、遮罩失敗封閉包裝)需要直接測試,它們不屬於公開契約。 -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Ozakboy.Http.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\LICENSE" Pack="true" PackagePath="\" />
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\logo.png" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <!--
+    相依政策:只允許 .NET BCL、Microsoft 官方套件與 Ozakboy.* 自研套件,判定看「遞移相依」而非套件名稱。
+    特別注意 Microsoft.Extensions.Http.Resilience:名稱掛 Microsoft,但遞移相依第三方的 Polly.Core,
+    因此禁止使用 —— 本套件的重試處理器就是為了頂替它而存在。
+    Dependency policy: only the .NET BCL, first-party Microsoft packages, and Ozakboy.* packages are allowed,
+    judged by the transitive graph rather than by package name. Microsoft.Extensions.Http.Resilience is
+    specifically excluded: it carries a Microsoft name but depends on the third-party Polly.Core, which is why
+    this package implements its own retry handler.
+  -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.12" />
+    <PackageReference Include="System.Threading.RateLimiting" Version="10.0.12" />
+    <PackageReference Include="Ozakboy.Core.Abstractions" Version="0.2.1" />
+    <PackageReference Include="Ozakboy.Security" Version="0.1.1" />
+  </ItemGroup>
+
+  <!--
+    刻意不引用 Microsoft.SourceLink.GitHub 套件,與其他 Ozakboy.* 套件一致。
+    自 .NET 8 起 SourceLink 已內建於 SDK,設定 PublishRepositoryUrl 與 EmbedUntrackedSources
+    (見 Directory.Build.props)即可;外掛套件反而會帶進有安全通報的相依,
+    在 TreatWarningsAsErrors 之下讓「還原」階段就直接失敗。
+  -->
+
+</Project>

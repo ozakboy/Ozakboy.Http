@@ -1,0 +1,38 @@
+# ── 建置產物 ──
+**/bin/
+**/obj/
+/artifacts/
+*.user
+*.suo
+
+# ── IDE ──
+.vs/
+.idea/
+*.DotSettings.user
+
+# ── 測試與涵蓋率 ──
+/TestResults/
+**/TestResults/
+*.coverage
+coverage*.json
+coverage*.xml
+*.trx
+
+# ── 套件輸出 ──
+*.nupkg
+*.snupkg
+
+# ── 作業系統 ──
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ── 機密(絕不進版控)──
+.claude/secrets.local.json
+**/secrets.local.json
+.env
+.env.*
+!.env.example
+*.pem
+*.pfx
+*.key

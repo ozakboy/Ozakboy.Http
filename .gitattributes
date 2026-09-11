@@ -1,0 +1,18 @@
+# 統一換行處理:文字檔在 repo 內一律存 LF,檢出到 Windows 工作區時轉 CRLF
+* text=auto
+
+*.cs      text diff=csharp
+*.csproj  text
+*.sln     text eol=crlf
+*.props   text
+*.targets text
+*.md      text
+*.json    text
+*.yml     text
+*.ps1     text eol=crlf
+*.sh      text eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.snk binary

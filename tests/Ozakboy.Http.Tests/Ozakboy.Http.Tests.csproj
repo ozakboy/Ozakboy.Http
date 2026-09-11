@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsTestProject>true</IsTestProject>
+
+    <!--
+      改用 MSTest 內建的 Microsoft.Testing.Platform 執行器,不走舊的 VSTest。
+      理由是相依政策:VSTest 那條路徑會經由 Microsoft.TestPlatform.ObjectModel 遞移帶進
+      Newtonsoft.Json —— 它掛在 Microsoft 的套件底下,但本身是第三方社群套件,
+      而本專案的判定標準是遞移相依而非套件名稱。搭配 repo 根目錄的 global.json(test.runner),
+      .NET 10 的 dotnet test 才會走 MTP。
+      Uses MSTest's built-in Microsoft.Testing.Platform runner instead of the legacy VSTest path. This is a
+      dependency-policy decision: VSTest transitively drags in Newtonsoft.Json through
+      Microsoft.TestPlatform.ObjectModel, a third-party library sitting under a Microsoft package, and this
+      project judges by the transitive graph rather than by package name. The repo-level global.json
+      (test.runner) is what makes dotnet test on .NET 10 pick MTP up.
+    -->
+    <EnableMSTestRunner>true</EnableMSTestRunner>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <!--
+    刻意不參照 MSTest 整合套件,而是直接點名它底下需要的部分(理由同上)。
+    覆蓋率由 Microsoft.Testing.Extensions.CodeCoverage 提供,trx 報告由 TrxReport 提供,兩者都不經過 VSTest。
+    Microsoft.Extensions.TimeProvider.Testing 提供 FakeTimeProvider:限流與重試的時間行為一律以假時鐘驗證,
+    不用 Thread.Sleep。它在 net10.0 下沒有任何遞移相依。
+    Deliberately avoids the MSTest metapackage and names the pieces it needs instead (same reasoning).
+    Microsoft.Extensions.TimeProvider.Testing supplies FakeTimeProvider: rate-limit and retry timing is
+    verified against a fake clock rather than Thread.Sleep. It has no transitive dependencies on net10.0.
+  -->
+  <ItemGroup>
+    <PackageReference Include="MSTest.TestAdapter" Version="4.0.2" />
+    <PackageReference Include="MSTest.TestFramework" Version="4.0.2" />
+    <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.1.0" />
+    <PackageReference Include="Microsoft.Testing.Extensions.TrxReport" Version="2.0.2" />
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" Version="10.10.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Ozakboy.Http\Ozakboy.Http.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Microsoft.VisualStudio.TestTools.UnitTesting" />
+    <Using Include="Microsoft.Extensions.Time.Testing" />
+    <Using Include="Ozakboy.Core.Abstractions" />
+    <Using Include="Ozakboy.Http" />
+  </ItemGroup>
+
+</Project>
