@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-13
+
+The facade may be a singleton; the `HttpClient` inside it may not. `CreateOzakboyHttpPipelineClient` now hands the
+facade the factory instead of a client built from it, so `IHttpClientFactory` gets to rotate handlers and DNS keeps
+up when the peer moves to a new IP.
+
+門面可以是單例,它裡面的 `HttpClient` 不行。`CreateOzakboyHttpPipelineClient` 改為把工廠本身交給門面,
+而不是工廠建出來的用戶端,`IHttpClientFactory` 的處理器輪替才有機會發生,對方換 IP 之後 DNS 才跟得上。
+
+### Fixed
+
+- **A facade built by `CreateOzakboyHttpPipelineClient` held one `HttpClient` for its whole life, so handlers
+  never rotated.** The facade is meant to be a singleton — `services.AddSingleton(p =>
+  p.CreateOzakboyHttpPipelineClient("exchange"))` is the documented registration, and that is how
+  `Ozakboy.TradeKit.Binance` registers it — but it took an `HttpClient` at construction and kept it. Handler
+  rotation under `SetHandlerLifetime` (two minutes by default) only gets its chance on *each* `CreateClient`
+  call, so one long-lived client stays pinned to a single handler and the connections it has already opened, and
+  the process never picks up a new address for a host that has moved. Exchanges do move, and nothing in the logs
+  says so: on a 24-hour unattended run the symptom is simply that requests stop getting through. The facade now
+  holds the `IHttpClientFactory` and the client name and calls `CreateClient` per request, which is the official
+  guidance — `CreateClient` is cheap and the expensive part, the handler, is pooled by the factory. The infinite
+  `HttpClient.Timeout` set in `AddOzakboyHttpPipeline`'s `ConfigureHttpClient` comes along with every client built
+  that way, as before.
+  `CreateOzakboyHttpPipelineClient` 建出的門面長期持有同一個 `HttpClient`,處理器永遠不會輪替:門面本來就是要註冊成單例的
+  (下游 `Ozakboy.TradeKit.Binance` 正是如此),但它在建構時取一個用戶端就一直用下去。`SetHandlerLifetime`(預設兩分鐘)
+  的輪替只在**每一次** `CreateClient` 時才有機會發生,長期持有等於永遠綁在同一個處理器與它已開的連線上,對方換 IP 之後就再也連不上,
+  而日誌上看不出任何原因 —— 無人值守跑一整天,症狀只是「請求送不出去了」。現在門面持有的是 `IHttpClientFactory` 與用戶端名稱,
+  每次請求各呼叫一次 `CreateClient`(這是官方建議用法:`CreateClient` 很便宜,昂貴的處理器由工廠池化與輪替)。
+  `AddOzakboyHttpPipeline` 在 `ConfigureHttpClient` 設定的無限 `HttpClient.Timeout` 一如以往,每次建出來都會帶到。
+
+### Added
+
+- **`HttpPipelineClient(IHttpClientFactory, clientName, timeouts, timeProvider, masker)`.** The constructor the
+  DI path now uses; the client name is the one given to `AddHttpClient`. Every 0.3.0 signature is still there and
+  none was changed.
+  新增接受 `IHttpClientFactory` 與用戶端名稱的建構式(DI 路徑改用它);0.3.0 的所有簽章都保留,沒有任何一個被改動。
+
+### Notes
+
+- **Both construction paths remain, and they differ in who owns the client's lifetime.** Passing an `HttpClient`
+  still behaves exactly as before — the facade uses that one client and never obtains another — and the caller
+  owns its lifetime and therefore its DNS behaviour. That path is for code that assembles the pipeline by hand
+  (`Ozakboy.Telegram` uses it). Code registering through a service container should build the facade with
+  `CreateOzakboyHttpPipelineClient`, which takes the factory path.
+  兩條建構路徑都在,差別在於誰負責用戶端的生命週期:傳入 `HttpClient` 的那條完全照舊(門面就用那一個,不會另外取),
+  生命週期與 DNS 行為由呼叫端負責,適用於手動組裝管線的程式(`Ozakboy.Telegram` 用它);
+  走服務容器的請以 `CreateOzakboyHttpPipelineClient` 建立門面,那條走工廠路徑。
+- The masker travels with the facade, not with the `HttpClient`, so error masking is unaffected; the secret-leak
+  suite is unchanged and still green.
+  遮罩器跟著門面走、不是跟著 `HttpClient`,錯誤遮罩完全沒有受到影響;祕密外洩測試未修改,仍然全綠。
+- 221 tests, all green (215 from 0.3.0 plus 6 new). Taking the client at construction again turns the two
+  "a client per request" tests red: `CreateClient` is called once instead of three times.
+  221 個測試全綠(0.3.0 的 215 條加 6 條新的)。把用戶端改回建構時取一次,「每次請求各取一個」的兩條測試會變紅 ——
+  `CreateClient` 只被呼叫一次,而不是三次。
+- Targets `net10.0`. Dependencies unchanged; no third-party package anywhere in the transitive graph.
+  相依不變,遞移相依樹中仍無任何第三方套件。
+
 ## [0.3.0] - 2026-09-12
 
 Fixes the pipeline order — which in 0.2.0 was the reverse of what its own comments described — and closes the
@@ -299,7 +356,8 @@ dependency graph. Written for an automated trading engine, but nothing about tra
   the third-party `Polly.Core`.
   刻意排除 `Microsoft.Extensions.Http.Resilience`(遞移相依第三方的 `Polly.Core`)。
 
-[Unreleased]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ozakboy/Ozakboy.Http/releases/tag/v0.1.0

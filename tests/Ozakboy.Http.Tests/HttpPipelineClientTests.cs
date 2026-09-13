@@ -193,8 +193,115 @@ public sealed class HttpPipelineClientTests
     }
 
     [TestMethod]
+    public async Task SendAsync_BuiltFromAFactory_TakesAClientForEveryRequest()
+    {
+        // 門面會被註冊成單例(下游正是這樣用的),所以它絕不能在建構時取一個 HttpClient 拿著不放:
+        // IHttpClientFactory 的處理器輪替(SetHandlerLifetime,預設兩分鐘)只在每次 CreateClient 時才有機會發生,
+        // 長期持有同一個用戶端等於永遠綁在同一組連線上,對方換 IP 之後 DNS 跟不上 —— 無人值守跑一整天,這是真問題。
+        // 這一條直接數 CreateClient 的次數:三個請求就該是三次,不是一次。
+        // The facade gets registered as a singleton (that is exactly how downstream uses it), so it must never
+        // take one HttpClient at construction and hold on to it: IHttpClientFactory's handler rotation
+        // (SetHandlerLifetime, two minutes by default) only gets its chance on each CreateClient call, and
+        // holding one client pins the pipeline to one set of connections, so DNS cannot keep up once the peer
+        // moves to a new IP — a real problem on an unattended day-long run. This test simply counts the
+        // CreateClient calls: three requests must be three calls, not one.
+        using var stub = StubHttpMessageHandler.AlwaysReturns(HttpStatusCode.OK, "pong");
+        var factory = new CountingHttpClientFactory(stub);
+        var client = new HttpPipelineClient(factory, "exchange", LongTimeouts());
+
+        for (var i = 0; i < 3; i++)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, "https://example.test/ping");
+            var result = await client.SendAsync(request, CancellationToken.None);
+
+            Assert.IsTrue(result.TryGetValue(out var response));
+            response.Dispose();
+        }
+
+        Assert.AreEqual(3, stub.CallCount);
+        Assert.AreEqual(
+            3,
+            factory.CreateClientCount,
+            "每一次請求都要向工廠取一次用戶端;只取一次代表門面長期持有同一個 HttpClient,處理器永遠不會輪替。A client must be taken from the factory per request; a single call means the facade is holding one HttpClient for good and the handlers will never rotate.");
+        Assert.AreEqual(3, factory.RequestedNames.Count);
+        Assert.IsTrue(
+            factory.RequestedNames.TrueForAll(name => string.Equals(name, "exchange", StringComparison.Ordinal)),
+            "每次都要取同一個具名用戶端。The same named client must be requested every time.");
+    }
+
+    [TestMethod]
+    public async Task SendForStringAsync_BuiltFromAFactory_TakesAClientForEveryRequest()
+    {
+        // SendForStringAsync 走的是同一條送出路徑,一併鎖住,以免哪天它改成自己送。
+        // SendForStringAsync goes out through the same path; pinned here too, in case it ever starts sending on
+        // its own.
+        using var stub = StubHttpMessageHandler.AlwaysReturns(HttpStatusCode.OK, "pong");
+        var factory = new CountingHttpClientFactory(stub);
+        var client = new HttpPipelineClient(factory, "exchange", LongTimeouts());
+
+        for (var i = 0; i < 3; i++)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, "https://example.test/ping");
+            var result = await client.SendForStringAsync(request, CancellationToken.None);
+
+            Assert.IsTrue(result.TryGetValue(out var body));
+            Assert.AreEqual("pong", body);
+        }
+
+        Assert.AreEqual(3, factory.CreateClientCount);
+    }
+
+    [TestMethod]
+    public async Task SendAsync_BuiltFromAnHttpClient_KeepsUsingTheClientItWasGiven()
+    {
+        // 手動建立的那條路徑仍在(Telegram 套件用它):門面用呼叫端給的那一個,生命週期也由呼叫端負責。
+        // The hand-built path is still there (the Telegram package uses it): the facade uses the client it was
+        // handed, and that client's lifetime stays with the caller.
+        using var stub = StubHttpMessageHandler.AlwaysReturns(HttpStatusCode.OK, "pong");
+        using var httpClient = new HttpClient(stub, disposeHandler: false);
+        var client = new HttpPipelineClient(httpClient, LongTimeouts());
+
+        for (var i = 0; i < 3; i++)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, "https://example.test/ping");
+            var result = await client.SendAsync(request, CancellationToken.None);
+
+            Assert.IsTrue(result.TryGetValue(out var response));
+            response.Dispose();
+        }
+
+        Assert.AreEqual(3, stub.CallCount);
+    }
+
+    [TestMethod]
     public void Constructor_NullClient_Throws() =>
         Assert.ThrowsExactly<ArgumentNullException>(() => new HttpPipelineClient(null!));
+
+    [TestMethod]
+    public void Constructor_NullFactory_Throws() =>
+        Assert.ThrowsExactly<ArgumentNullException>(() => new HttpPipelineClient((IHttpClientFactory)null!, "exchange"));
+
+    [TestMethod]
+    public void Constructor_BlankClientName_Throws()
+    {
+        using var stub = StubHttpMessageHandler.AlwaysReturns(HttpStatusCode.OK);
+        var factory = new CountingHttpClientFactory(stub);
+
+        Assert.ThrowsExactly<ArgumentNullException>(() => new HttpPipelineClient(factory, null!));
+        Assert.ThrowsExactly<ArgumentException>(() => new HttpPipelineClient(factory, "   "));
+    }
+
+    [TestMethod]
+    public void Constructor_FactoryOverload_ValidatesTheTimeouts()
+    {
+        using var stub = StubHttpMessageHandler.AlwaysReturns(HttpStatusCode.OK);
+        var factory = new CountingHttpClientFactory(stub);
+
+        Assert.ThrowsExactly<ArgumentException>(() => new HttpPipelineClient(
+            factory,
+            "exchange",
+            new HttpTimeoutOptions { AttemptTimeout = TimeSpan.FromMinutes(1), OverallTimeout = TimeSpan.FromSeconds(1) }));
+    }
 
     [TestMethod]
     public void Constructor_OverallShorterThanAttempt_Throws()

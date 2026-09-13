@@ -36,21 +36,54 @@ namespace Ozakboy.Http;
 /// at construction; pass the named client's (<see cref="OzakboyHttpServiceProviderExtensions.GetOzakboyHttpMasker"/>),
 /// or this checkpoint knows only the secrets on <see cref="SecretMasker.Default"/>.
 /// </para>
+/// <para>
+/// <b>門面本身可以是單例,但 <see cref="HttpClient"/> 不可以被長期持有。</b>門面沒有可變狀態 —— 逾時、時間來源、
+/// 遮罩器都是唯讀設定,註冊成單例完全沒問題。<see cref="HttpClient"/> 則不同:<see cref="IHttpClientFactory"/>
+/// 的處理器輪替(<c>SetHandlerLifetime</c>,預設兩分鐘)只在<b>每一次</b> <c>CreateClient</c> 時才有機會生效。
+/// 長期持有同一個 <see cref="HttpClient"/> 等於永遠綁在同一個處理器與它已建立的連線上,對方換 IP 之後 DNS 跟不上 ——
+/// 交易所確實會換 IP,而這個症狀只在長時間無人值守的執行中出現,現場看起來就是「跑了一天之後連不上」。
+/// 因此以 <see cref="OzakboyHttpServiceProviderExtensions.CreateOzakboyHttpPipelineClient"/> 建立的門面持有的是
+/// <see cref="IHttpClientFactory"/> 與用戶端名稱,每一次請求各取一個 <see cref="HttpClient"/>;
+/// <c>CreateClient</c> 很便宜,真正昂貴的處理器由 factory 池化與輪替。
+/// <b>The facade may be a singleton; an <see cref="HttpClient"/> may not be held for the long term.</b> The
+/// facade has no mutable state — timeouts, time source and masker are read-only settings — so registering it as
+/// a singleton is fine. An <see cref="HttpClient"/> is another matter: <see cref="IHttpClientFactory"/>'s handler
+/// rotation (<c>SetHandlerLifetime</c>, two minutes by default) only gets its chance on <b>each</b>
+/// <c>CreateClient</c> call. Holding one client for the long term pins the pipeline to a single handler and the
+/// connections it has already established, so DNS never catches up once the peer moves to a new IP — exchanges do
+/// move, and the symptom surfaces only on long unattended runs, looking from the outside like "it stopped
+/// connecting after a day". A facade built through
+/// <see cref="OzakboyHttpServiceProviderExtensions.CreateOzakboyHttpPipelineClient"/> therefore holds the
+/// <see cref="IHttpClientFactory"/> and the client name and obtains an <see cref="HttpClient"/> per request;
+/// <c>CreateClient</c> is cheap, and the expensive part — the handler — is pooled and rotated by the factory.
+/// </para>
 /// </remarks>
 public sealed class HttpPipelineClient
 {
-    private readonly HttpClient _httpClient;
+    // 兩條建構路徑二選一:_httpClientFactory 為 null 時用呼叫端自備的 _pinnedClient,
+    // 否則每次請求各向 factory 取一個(生命週期與 DNS 輪替的差異見型別說明)。
+    // The two construction paths are mutually exclusive: a null _httpClientFactory means the caller's own
+    // _pinnedClient is used, otherwise one client is taken from the factory per request. See the type remarks
+    // for how the lifetime and DNS rotation differ between them.
+    private readonly HttpClient? _pinnedClient;
+    private readonly IHttpClientFactory? _httpClientFactory;
+    private readonly string? _clientName;
     private readonly HttpTimeoutOptions _timeouts;
     private readonly TimeProvider _timeProvider;
     private readonly SecretMasker _masker;
 
     /// <summary>
-    /// 建立門面。
-    /// Creates the facade.
+    /// 以呼叫端自備的 <see cref="HttpClient"/> 建立門面;這個用戶端的生命週期由呼叫端負責。
+    /// Creates the facade over an <see cref="HttpClient"/> the caller supplies and whose lifetime the caller owns.
     /// </summary>
     /// <param name="httpClient">
-    /// 已組好管線的用戶端。通常來自 <see cref="IHttpClientFactory"/>。
-    /// The client with the pipeline already assembled, usually from <see cref="IHttpClientFactory"/>.
+    /// 已組好管線的用戶端。門面會一直用這一個,不會另外取得新的 —— 因此它的生命週期(以及
+    /// <see cref="IHttpClientFactory"/> 的處理器輪替跟不跟得上 DNS 變動)完全由呼叫端決定。
+    /// 由服務容器註冊的具名用戶端請改用接受 <see cref="IHttpClientFactory"/> 的多載。
+    /// The client with the pipeline already assembled. The facade keeps using this one and never obtains another,
+    /// so its lifetime — and therefore whether <see cref="IHttpClientFactory"/>'s handler rotation can keep up
+    /// with DNS changes — is entirely the caller's business. For a named client registered in a service
+    /// container, use the overload taking an <see cref="IHttpClientFactory"/> instead.
     /// </param>
     /// <param name="timeouts">逾時設定;<see langword="null"/> 時使用預設值。The timeout options; defaults are used when <see langword="null"/>.</param>
     /// <param name="timeProvider">時間來源;測試請傳入假時鐘。The time source; tests pass a fake clock.</param>
@@ -67,12 +100,14 @@ public sealed class HttpPipelineClient
     }
 
     /// <summary>
-    /// 建立門面,並指定錯誤邊界使用的遮罩器。
-    /// Creates the facade with the masker its error boundary uses.
+    /// 以呼叫端自備的 <see cref="HttpClient"/> 建立門面,並指定錯誤邊界使用的遮罩器;這個用戶端的生命週期由呼叫端負責。
+    /// Creates the facade over a caller-supplied <see cref="HttpClient"/>, whose lifetime the caller owns, with the
+    /// masker its error boundary uses.
     /// </summary>
     /// <param name="httpClient">
-    /// 已組好管線的用戶端。通常來自 <see cref="IHttpClientFactory"/>。
-    /// The client with the pipeline already assembled, usually from <see cref="IHttpClientFactory"/>.
+    /// 已組好管線的用戶端。門面會一直用這一個,不會另外取得新的;生命週期與 DNS 輪替由呼叫端負責。
+    /// The client with the pipeline already assembled. The facade keeps using this one and never obtains another;
+    /// its lifetime, and DNS rotation with it, is the caller's responsibility.
     /// </param>
     /// <param name="timeouts">逾時設定;<see langword="null"/> 時使用預設值。The timeout options; defaults are used when <see langword="null"/>.</param>
     /// <param name="timeProvider">時間來源;測試請傳入假時鐘。The time source; tests pass a fake clock.</param>
@@ -93,15 +128,67 @@ public sealed class HttpPipelineClient
     {
         ArgumentNullException.ThrowIfNull(httpClient);
 
-        var effectiveTimeouts = timeouts ?? new HttpTimeoutOptions();
-        var validation = effectiveTimeouts.Validate();
-        if (validation.IsFailure)
-        {
-            throw new ArgumentException(validation.Error.Message, nameof(timeouts));
-        }
+        _pinnedClient = httpClient;
+        _timeouts = ValidateTimeouts(timeouts);
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _masker = masker ?? SecretMasker.Default;
+    }
 
-        _httpClient = httpClient;
-        _timeouts = effectiveTimeouts;
+    /// <summary>
+    /// 以 <see cref="IHttpClientFactory"/> 與具名用戶端建立門面:每一次請求各取一個 <see cref="HttpClient"/>,
+    /// 讓 factory 的處理器輪替得以生效。門面本身可以是單例。
+    /// Creates the facade from an <see cref="IHttpClientFactory"/> and a client name, obtaining one
+    /// <see cref="HttpClient"/> per request so that the factory's handler rotation can take effect. The facade
+    /// itself may be a singleton.
+    /// </summary>
+    /// <param name="httpClientFactory">用戶端工廠。The client factory.</param>
+    /// <param name="clientName">
+    /// 用戶端名稱,與 <c>AddHttpClient</c> 時相同。The client name used with <c>AddHttpClient</c>.
+    /// </param>
+    /// <param name="timeouts">逾時設定;<see langword="null"/> 時使用預設值。The timeout options; defaults are used when <see langword="null"/>.</param>
+    /// <param name="timeProvider">時間來源;測試請傳入假時鐘。The time source; tests pass a fake clock.</param>
+    /// <param name="masker">
+    /// 遮罩器,通常是 <see cref="OzakboyHttpServiceProviderExtensions.GetOzakboyHttpMasker"/> 取得的那一個;
+    /// <see langword="null"/> 時使用 <see cref="SecretMasker.Default"/>。
+    /// The masker, usually the one from <see cref="OzakboyHttpServiceProviderExtensions.GetOzakboyHttpMasker"/>;
+    /// <see cref="SecretMasker.Default"/> when <see langword="null"/>.
+    /// </param>
+    /// <remarks>
+    /// 這條路徑與接受 <see cref="HttpClient"/> 的多載差別只有一處,但後果不小:門面不持有 <see cref="HttpClient"/>,
+    /// 每次請求各取一個,因此 <c>SetHandlerLifetime</c>(預設兩分鐘)的處理器輪替才有機會發生,對方換 IP 之後 DNS 跟得上。
+    /// 手動傳入 <see cref="HttpClient"/> 的那條路徑會一直用同一個,長期持有等於永遠綁在同一組連線上。
+    /// 由服務容器建立時請直接用 <see cref="OzakboyHttpServiceProviderExtensions.CreateOzakboyHttpPipelineClient"/>,
+    /// 它會連同這個用戶端的遮罩器與同一份逾時設定一起帶入。
+    /// This path differs from the <see cref="HttpClient"/> overload in one respect with sizeable consequences: the
+    /// facade holds no <see cref="HttpClient"/> and takes one per request, so handler rotation under
+    /// <c>SetHandlerLifetime</c> (two minutes by default) actually gets to happen and DNS keeps up when the peer
+    /// moves to a new IP. The hand-supplied-client path keeps using the one it was given, which over a long run
+    /// pins it to one set of connections. From a service container, prefer
+    /// <see cref="OzakboyHttpServiceProviderExtensions.CreateOzakboyHttpPipelineClient"/>, which also brings in
+    /// that client's masker and the same timeout settings.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="httpClientFactory"/> 為 <see langword="null"/> 時擲出。
+    /// Thrown when <paramref name="httpClientFactory"/> is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="clientName"/> 為 <see langword="null"/> 或空白,或逾時設定不合法時擲出。
+    /// Thrown when <paramref name="clientName"/> is <see langword="null"/> or blank, or the timeout options are
+    /// invalid.
+    /// </exception>
+    public HttpPipelineClient(
+        IHttpClientFactory httpClientFactory,
+        string clientName,
+        HttpTimeoutOptions? timeouts = null,
+        TimeProvider? timeProvider = null,
+        SecretMasker? masker = null)
+    {
+        ArgumentNullException.ThrowIfNull(httpClientFactory);
+        ArgumentException.ThrowIfNullOrWhiteSpace(clientName);
+
+        _httpClientFactory = httpClientFactory;
+        _clientName = clientName;
+        _timeouts = ValidateTimeouts(timeouts);
         _timeProvider = timeProvider ?? TimeProvider.System;
         _masker = masker ?? SecretMasker.Default;
     }
@@ -121,12 +208,19 @@ public sealed class HttpPipelineClient
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        // 每一次請求各取一個用戶端(工廠路徑),處理器輪替才有機會發生;取得的用戶端刻意不釋放:
+        // 工廠給的用戶端本來就不需要釋放(昂貴的處理器由工廠池化),釋放它也不會歸還或關閉那個處理器。
+        // One client per request on the factory path, which is what gives handler rotation its chance. The client
+        // obtained is deliberately not disposed: a factory-provided client needs no disposal — the expensive part,
+        // the handler, is pooled by the factory — and disposing it would neither return nor close that handler.
+        var httpClient = ResolveHttpClient();
+
         using var timeoutSource = new CancellationTokenSource(_timeouts.OverallTimeout, _timeProvider);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutSource.Token);
 
         try
         {
-            return await _httpClient.SendAsync(request, linked.Token).ConfigureAwait(false);
+            return await httpClient.SendAsync(request, linked.Token).ConfigureAwait(false);
         }
         catch (ResultException exception) when (
             exception.Error.Category == ErrorCategory.Cancelled
@@ -210,6 +304,23 @@ public sealed class HttpPipelineClient
                 return HttpErrorMapper.FromException(exception, _masker);
             }
         }
+    }
+
+    private HttpClient ResolveHttpClient() =>
+        _httpClientFactory is null
+            ? _pinnedClient!
+            : _httpClientFactory.CreateClient(_clientName!);
+
+    private static HttpTimeoutOptions ValidateTimeouts(HttpTimeoutOptions? timeouts)
+    {
+        var effectiveTimeouts = timeouts ?? new HttpTimeoutOptions();
+        var validation = effectiveTimeouts.Validate();
+        if (validation.IsFailure)
+        {
+            throw new ArgumentException(validation.Error.Message, nameof(timeouts));
+        }
+
+        return effectiveTimeouts;
     }
 
     private static Error DescribeCancellation(

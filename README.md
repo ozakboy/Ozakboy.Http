@@ -63,6 +63,8 @@ services.AddSingleton(provider => provider.CreateOzakboyHttpPipelineClient("exch
 
 `CreateOzakboyHttpPipelineClient` is the recommended way to get an `HttpPipelineClient`. The facade is the last checkpoint an error passes before leaving the package, and it masks with whatever masker it was built with; constructed by hand, forgetting the masker raises no error, it just leaves that checkpoint knowing only `SecretMasker.Default`. The overall timeout comes from the same registration, so it cannot drift from the one the retry handler uses. It is a method on the service provider rather than another registration so the lifetime stays yours.
 
+**Why the facade can be a singleton while an `HttpClient` must not be held.** The `AddSingleton` above is deliberate: the facade carries no mutable state — timeouts, time source and masker are read-only settings. What it does *not* do is hold an `HttpClient`. It holds the `IHttpClientFactory` and the client name, and takes a client per request. That distinction is the whole point: `IHttpClientFactory` rotates its handlers on a lifetime (`SetHandlerLifetime`, two minutes by default), and rotation only gets its chance on each `CreateClient` call. A client captured once and kept stays bound to a single handler and the connections it has already opened, so the process never learns that the host has moved to a new address — and exchanges do move. Nothing in the logs explains it; on a long unattended run the requests simply stop getting through. `CreateClient` is cheap and the expensive part — the handler — is pooled by the factory, so calling it per request is the official guidance rather than a workaround.
+
 ### What `AddOzakboyHttpPipeline` does to the client
 
 Besides attaching the four handlers, it changes three things on the named client:
@@ -158,10 +160,11 @@ Masking is `Ozakboy.Security`'s `SecretMasker`, whose default name list already 
 
 ## Failures come back as `Result<T>`
 
-`HttpPipelineClient` wraps the assembled `HttpClient` and converts the exception path back into `Result<T>`, so callers handle one shape rather than remembering which exceptions to catch.
+`HttpPipelineClient` sits in front of the assembled pipeline and converts the exception path back into `Result<T>`, so callers handle one shape rather than remembering which exceptions to catch.
 
 ```csharp
-var client = new HttpPipelineClient(httpClient, timeouts);
+// From a service container: the facade takes a client from the factory per request.
+var client = provider.CreateOzakboyHttpPipelineClient("exchange");
 
 var result = await client.SendForStringAsync(request, cancellationToken);
 if (!result.TryGetValue(out var body))
@@ -179,6 +182,8 @@ Diagnostic values travel in `Error.Data` under the keys in `HttpErrorDataKeys`, 
 Callers who use a bare `HttpClient` instead of the facade catch `ResultException` from `Ozakboy.Core.Abstractions`. It is the one carrier every Ozakboy package uses to move an `Error` across a boundary whose signature belongs to the BCL, its `Error` property is never null, and it derives from `InvalidOperationException` — so there is a single exception type to catch rather than one per package.
 
 Its `InnerException`, like `Error.Exception`, is a `SanitizedException`, never the original type: branch on `Error.Code` and `Error.Category` rather than on exception types. And build `HttpPipelineClient` with `CreateOzakboyHttpPipelineClient`, which hands it the client's masker; it is the last checkpoint an error passes on its way out, and without that masker it only knows the secrets on `SecretMasker.Default`.
+
+There is a second construction path for pipelines assembled by hand, outside a service container: `new HttpPipelineClient(httpClient, timeouts, timeProvider, masker)`. The facade then uses the client it was handed and never obtains another, so that client's lifetime — and with it whether handlers ever rotate and DNS stays current — is the caller's responsibility. Within a service container, prefer `CreateOzakboyHttpPipelineClient`, which takes the factory path described above.
 
 ---
 

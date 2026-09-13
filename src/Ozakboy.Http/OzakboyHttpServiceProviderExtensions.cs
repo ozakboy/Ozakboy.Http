@@ -95,6 +95,19 @@ public static class OzakboyHttpServiceProviderExtensions
     /// the caller's choice (usually <c>services.AddSingleton(p =&gt; p.CreateOzakboyHttpPipelineClient("exchange"))</c>),
     /// and several named clients need no keyed <see cref="HttpPipelineClient"/> registrations of their own.
     /// </para>
+    /// <para>
+    /// <b>門面註冊成單例是可以的,因為它不持有 <see cref="HttpClient"/>。</b>這個方法交給門面的是
+    /// <see cref="IHttpClientFactory"/> 與用戶端名稱,門面每一次請求才各取一個用戶端。差別在於
+    /// <c>SetHandlerLifetime</c>(預設兩分鐘)的處理器輪替只在每次 <c>CreateClient</c> 時才有機會發生:
+    /// 若門面在建構時取一個 <see cref="HttpClient"/> 拿著不放,輪替就永遠輪不到,對方換 IP 之後 DNS 跟不上,
+    /// 症狀只會在長時間無人值守的執行中出現。
+    /// <b>Registering the facade as a singleton is fine because it holds no <see cref="HttpClient"/>.</b> This
+    /// method hands the facade the <see cref="IHttpClientFactory"/> and the client name, and the facade takes a
+    /// client per request. What turns on this is that handler rotation under <c>SetHandlerLifetime</c> (two
+    /// minutes by default) only gets its chance on each <c>CreateClient</c> call: a facade that took one
+    /// <see cref="HttpClient"/> at construction and held on to it would never rotate, so DNS could not keep up
+    /// once the peer moved to a new IP — a symptom that surfaces only on long unattended runs.
+    /// </para>
     /// </remarks>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="provider"/> 為 <see langword="null"/> 時擲出。
@@ -118,8 +131,12 @@ public static class OzakboyHttpServiceProviderExtensions
             ?? throw new InvalidOperationException(
                 "這個用戶端名稱沒有以 AddOzakboyHttpPipeline 註冊過,無法建立門面。No client of this name was registered through AddOzakboyHttpPipeline, so no facade can be built.");
 
+        // 交出工廠而不是工廠建出來的用戶端:門面通常被註冊成單例,拿著同一個 HttpClient 不放會讓處理器永不輪替。
+        // The factory is handed over rather than a client built from it: the facade is usually registered as a
+        // singleton, and holding one HttpClient for its whole life would stop the handlers ever rotating.
         return new HttpPipelineClient(
-            provider.GetRequiredService<IHttpClientFactory>().CreateClient(clientName),
+            provider.GetRequiredService<IHttpClientFactory>(),
+            clientName,
             registration.Timeouts,
             provider.GetService<TimeProvider>(),
             provider.GetOzakboyHttpMasker(clientName));

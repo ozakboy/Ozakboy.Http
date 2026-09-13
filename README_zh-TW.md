@@ -63,6 +63,8 @@ services.AddSingleton(provider => provider.CreateOzakboyHttpPipelineClient("exch
 
 建立 `HttpPipelineClient` 的建議做法是 `CreateOzakboyHttpPipelineClient`。門面是錯誤離開本套件前的最後一道關口,用的是建構時傳入的遮罩器;手動 `new` 時漏傳遮罩器不會有任何錯誤,只是那道關口默默地只認得 `SecretMasker.Default`。整體逾時也從同一份註冊取回,不會和重試處理器用的那份不一致。做成服務容器上的方法而不是另一筆註冊,是讓生命週期留給你決定。
 
+**為什麼門面可以是單例,`HttpClient` 卻不能被長期持有。** 上面用 `AddSingleton` 是刻意的:門面沒有可變狀態,逾時、時間來源、遮罩器都是唯讀設定。它不做的事是持有 `HttpClient` —— 它持有的是 `IHttpClientFactory` 與用戶端名稱,每一次請求才各取一個用戶端。關鍵就在這裡:`IHttpClientFactory` 會依生命週期輪替處理器(`SetHandlerLifetime`,預設兩分鐘),而輪替只在每次 `CreateClient` 時才有機會發生。取一次就一直拿著的用戶端會永遠綁在同一個處理器與它已開的連線上,對方換了位址也不會知道 —— 交易所確實會換 IP。日誌上不會有任何線索,長時間無人值守跑下去,症狀只是「請求送不出去了」。`CreateClient` 很便宜,真正昂貴的處理器由工廠池化,所以每次請求各取一個是官方建議用法,不是什麼變通手法。
+
 ### `AddOzakboyHttpPipeline` 對用戶端做了什麼
 
 除了掛上四個處理器,它還對這個具名用戶端改了三件事:
@@ -158,10 +160,11 @@ HTTP 送出 GET https://api.example.com/fapi/v1/order?symbol=BTCUSDT&apiKey=vmPU
 
 ## 失敗一律回傳 `Result<T>`
 
-`HttpPipelineClient` 包住組好的 `HttpClient`,把例外路徑收斂回 `Result<T>`,呼叫端只需要處理一種形狀,不必記得哪些例外要攔。
+`HttpPipelineClient` 站在組好的管線前面,把例外路徑收斂回 `Result<T>`,呼叫端只需要處理一種形狀,不必記得哪些例外要攔。
 
 ```csharp
-var client = new HttpPipelineClient(httpClient, timeouts);
+// 走服務容器:門面每一次請求才向工廠取一個用戶端。
+var client = provider.CreateOzakboyHttpPipelineClient("exchange");
 
 var result = await client.SendForStringAsync(request, cancellationToken);
 if (!result.TryGetValue(out var body))
@@ -179,6 +182,8 @@ if (!result.TryGetValue(out var body))
 不走門面、直接用 `HttpClient` 的呼叫端,攔的是 `Ozakboy.Core.Abstractions` 的 `ResultException`。它是 Ozakboy 各套件共用的那一個載具,專門在「簽章由 BCL 決定、`Result<T>` 過不去」的邊界上攜帶 `Error`;`Error` 屬性保證非 null,型別繼承自 `InvalidOperationException`。要攔的例外只有這一種,不會每個套件各一種。
 
 它的 `InnerException` 和 `Error.Exception` 一樣是 `SanitizedException`,不會是原始型別:請以 `Error.Code` 與 `Error.Category` 分支,不要看例外型別。另外,請以 `CreateOzakboyHttpPipelineClient` 建立 `HttpPipelineClient`,它會帶入用戶端的遮罩器 —— 門面是錯誤離開本套件前的最後一道關口,少了那個遮罩器,就只認得 `SecretMasker.Default` 上的祕密。
+
+另一條建構路徑留給服務容器之外、手動組裝管線的程式:`new HttpPipelineClient(httpClient, timeouts, timeProvider, masker)`。走這條路徑的門面會一直用你交給它的那一個用戶端,不會另外取,因此那個用戶端的生命週期 —— 連同處理器輪不輪替、DNS 跟不跟得上 —— 都由你負責。在服務容器裡請用 `CreateOzakboyHttpPipelineClient`,它走的是上面說的工廠路徑。
 
 ---
 
