@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-14
+
+A service that sends a farewell request from its own `DisposeAsync` got an `ObjectDisposedException` instead. The
+facade now builds its handler chain at construction, which is what puts the pipeline's own container-held services
+in the right place in the container's disposal order.
+
+在自己的 `DisposeAsync` 裡送出收尾請求的服務會拿到 `ObjectDisposedException`。門面改為在建構當下就把處理器鏈建起來,
+管線自己那些由容器持有的服務才會落在容器釋放順序中該有的位置。
+
+### Fixed
+
+- **0.3.1 regression: a shutdown-time request through the facade failed with
+  `ObjectDisposedException: WeightedRateLimiter`.** A service container disposes what it created in reverse order
+  of creation, and that is the entire basis for "a dependant is disposed before the things it depends on".
+  0.3.1 moved `CreateClient` from facade construction to each request, which also moved the moment the named
+  client's handler chain — and with it the container-held limiter keyed by client name — is first created. The
+  limiter therefore entered the container's disposal list *after* the service that sends requests through it, so
+  at shutdown the limiter was disposed *first*. Anything sending a farewell request from its own `DisposeAsync`
+  then threw: `Ozakboy.TradeKit.Binance`'s user data stream `DELETE`s its listenKey on the way out, and that
+  delete stopped going out, leaving the stream credential to lapse on its own instead of being released. The
+  symptom exists only on the shutdown path — a running process is unaffected, and nothing upstream of shutdown
+  hints at it. The factory constructor now takes one client at construction and drops it, purely to build the
+  handler chain at the point 0.3.0 built it; a client is still taken per request, so the handler rotation 0.3.1
+  was written for is unchanged.
+  0.3.1 的回歸:關機時經門面送出的請求會以 `ObjectDisposedException: WeightedRateLimiter` 失敗。服務容器的釋放順序是
+  建立順序的反序,「相依者先於它所相依的東西被釋放」全靠這一點。0.3.1 把 `CreateClient` 從門面建構時移到每次請求,
+  連帶把「具名用戶端的處理器鏈第一次被建立」的時機也往後移了,於是以用戶端名稱為鍵、由容器持有的限流器,
+  比用它送請求的服務**更晚**進到容器的待釋放清單,關機時反而**先**被釋放。任何在自己的 `DisposeAsync` 裡送收尾請求的
+  服務都會因此擲出例外:`Ozakboy.TradeKit.Binance` 的使用者資料串流收尾時要 `DELETE` 掉 listenKey,那個刪除就此送不出去,
+  串流憑證只能留到自然過期而不是當場釋放。這個症狀只存在於關機路徑 —— 執行中的行程完全不受影響,關機之前也沒有任何跡象。
+  工廠建構式現在會在建構當下取一個用戶端隨即丟掉,目的只是把處理器鏈建在 0.3.0 建立它的那個時間點;
+  每次請求仍然各取一個用戶端,0.3.1 要的處理器輪替沒有任何改變。
+
+### Notes
+
+- **The two "a client per request" tests now expect one more call.** The warm-up at construction makes it one
+  plus one per request; the tests assert the warm-up separately so that neither half can regress unnoticed.
+  「每次請求各取一個」的兩條測試期望值各多一次:建構時的暖機加上每次請求各一次;暖機本身另外斷言,
+  兩半都不會無聲地退化。
+- **A regression test pins the actual invariant, not the call count.** `FarewellRequestService` sends a request
+  from its `DisposeAsync` while the container tears down; without the warm-up it fails with the exact
+  `ObjectDisposedException` above.
+  回歸測試鎖的是真正的不變式而不是呼叫次數:`FarewellRequestService` 在容器釋放期間從自己的 `DisposeAsync` 送出請求,
+  沒有暖機就會以上述那個 `ObjectDisposedException` 失敗。
+- 222 tests, all green (221 from 0.3.1 plus 1 new). No public signature changed.
+  222 個測試全綠(0.3.1 的 221 條加 1 條新的)。沒有任何公開簽章被改動。
+- Targets `net10.0`. Dependencies unchanged; no third-party package anywhere in the transitive graph.
+  相依不變,遞移相依樹中仍無任何第三方套件。
+
 ## [0.3.1] - 2026-09-13
 
 The facade may be a singleton; the `HttpClient` inside it may not. `CreateOzakboyHttpPipelineClient` now hands the
@@ -356,7 +405,8 @@ dependency graph. Written for an automated trading engine, but nothing about tra
   the third-party `Polly.Core`.
   刻意排除 `Microsoft.Extensions.Http.Resilience`(遞移相依第三方的 `Polly.Core`)。
 
-[Unreleased]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.1.0...v0.2.0

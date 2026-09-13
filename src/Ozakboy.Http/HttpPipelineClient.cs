@@ -166,6 +166,25 @@ public sealed class HttpPipelineClient
     /// pins it to one set of connections. From a service container, prefer
     /// <see cref="OzakboyHttpServiceProviderExtensions.CreateOzakboyHttpPipelineClient"/>, which also brings in
     /// that client's masker and the same timeout settings.
+    /// <para>
+    /// <b>處理器鏈在這裡就建起來,不等到第一次請求。</b>建構時先向工廠取一個用戶端隨即丟掉,唯一的目的是讓管線
+    /// 自己的服務(例如以用戶端名稱為鍵、由容器持有的限流器)在「這個時間點」被建立。服務容器的釋放順序是
+    /// 建立順序的反序,「相依者先於它所相依的東西被釋放」全靠這一點:處理器鏈若拖到第一次請求才建,
+    /// 限流器就會比用它送請求的服務更晚進到容器的待釋放清單,關機時反而先被釋放。後果是任何在自己的
+    /// <c>DisposeAsync</c> 裡送出收尾請求的服務都會拿到 <see cref="ObjectDisposedException"/> ——
+    /// 幣安使用者資料串流收尾時要 <c>DELETE</c> 掉 listenKey 就是一例,那把串流憑證會因此留到自然過期。
+    /// 這種症狀只在關機路徑上出現,平常怎麼跑都正常。
+    /// <b>The handler chain is built here, not at the first request.</b> A client is taken from the factory at
+    /// construction and immediately dropped, for one purpose: to have the pipeline's own services — such as the
+    /// container-held limiter keyed by client name — created at <i>this</i> point. A service container disposes in
+    /// reverse order of creation, and that is the whole basis for "a dependant is disposed before what it depends
+    /// on": deferring the handler chain to the first request would put the limiter into the container's disposal
+    /// list later than the service sending requests through it, so at shutdown the limiter would go first. Any
+    /// service that sends a farewell request from its own <c>DisposeAsync</c> would then get an
+    /// <see cref="ObjectDisposedException"/> — the Binance user data stream's <c>DELETE</c> of its listenKey is one,
+    /// and the stream credential would be left to lapse on its own. The symptom appears only on the shutdown path;
+    /// everything looks fine while running.
+    /// </para>
     /// </remarks>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="httpClientFactory"/> 為 <see langword="null"/> 時擲出。
@@ -191,6 +210,12 @@ public sealed class HttpPipelineClient
         _timeouts = ValidateTimeouts(timeouts);
         _timeProvider = timeProvider ?? TimeProvider.System;
         _masker = masker ?? SecretMasker.Default;
+
+        // 這裡取一個用戶端隨即丟掉,要的不是用戶端,而是逼工廠「現在」就把這個具名用戶端的處理器鏈建起來。
+        // 理由是釋放順序,見這個建構式的說明。
+        // A client is taken and dropped here: what is wanted is not the client but the handler chain, built now
+        // rather than at the first request. The reason is disposal order; see this constructor's remarks.
+        _ = ResolveHttpClient();
     }
 
     /// <summary>

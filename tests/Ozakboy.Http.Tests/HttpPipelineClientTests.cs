@@ -1,5 +1,7 @@
 using System.Net;
 using System.Net.Http.Headers;
+using Microsoft.Extensions.DependencyInjection;
+using Ozakboy.Http.RateLimiting;
 using Ozakboy.Http.Tests.TestSupport;
 
 namespace Ozakboy.Http.Tests;
@@ -209,6 +211,12 @@ public sealed class HttpPipelineClientTests
         var factory = new CountingHttpClientFactory(stub);
         var client = new HttpPipelineClient(factory, "exchange", LongTimeouts());
 
+        // 建構時的那一次是刻意的暖機(把處理器鏈建在容器的釋放順序裡該有的位置,見建構式說明),
+        // 之後才是每次請求各一次。
+        // The one call at construction is the deliberate warm-up that puts the handler chain where it belongs in
+        // the container's disposal order (see the constructor remarks); the rest are one per request.
+        Assert.AreEqual(1, factory.CreateClientCount);
+
         for (var i = 0; i < 3; i++)
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, "https://example.test/ping");
@@ -220,10 +228,10 @@ public sealed class HttpPipelineClientTests
 
         Assert.AreEqual(3, stub.CallCount);
         Assert.AreEqual(
-            3,
+            4,
             factory.CreateClientCount,
-            "每一次請求都要向工廠取一次用戶端;只取一次代表門面長期持有同一個 HttpClient,處理器永遠不會輪替。A client must be taken from the factory per request; a single call means the facade is holding one HttpClient for good and the handlers will never rotate.");
-        Assert.AreEqual(3, factory.RequestedNames.Count);
+            "暖機一次加上每一次請求各一次;停在 1 代表門面長期持有同一個 HttpClient,處理器永遠不會輪替。One warm-up plus one per request; stopping at 1 means the facade is holding one HttpClient for good and the handlers will never rotate.");
+        Assert.AreEqual(4, factory.RequestedNames.Count);
         Assert.IsTrue(
             factory.RequestedNames.TrueForAll(name => string.Equals(name, "exchange", StringComparison.Ordinal)),
             "每次都要取同一個具名用戶端。The same named client must be requested every time.");
@@ -248,7 +256,8 @@ public sealed class HttpPipelineClientTests
             Assert.AreEqual("pong", body);
         }
 
-        Assert.AreEqual(3, factory.CreateClientCount);
+        // 建構時暖機一次,三次請求各一次。The warm-up at construction plus one per request.
+        Assert.AreEqual(4, factory.CreateClientCount);
     }
 
     [TestMethod]
@@ -271,6 +280,53 @@ public sealed class HttpPipelineClientTests
         }
 
         Assert.AreEqual(3, stub.CallCount);
+    }
+
+    [TestMethod]
+    public async Task ContainerDisposal_ServiceSendingAFarewellRequest_StillHasAWorkingPipeline()
+    {
+        // 這一條鎖住的是釋放順序,不是送出行為。管線裡的限流器是以用戶端名稱為鍵、由容器持有的單例,
+        // 而容器的釋放順序是建立順序的反序 ——「相依者先於它所相依的東西被釋放」全靠這一點。
+        // 門面若拖到第一次請求才建處理器鏈,限流器就會比用它送請求的服務更晚進到待釋放清單,關機時反而先被釋放,
+        // 於是任何在自己的 DisposeAsync 裡送收尾請求的服務(幣安使用者資料串流要 DELETE 掉 listenKey 就是一例)
+        // 會拿到 ObjectDisposedException,而且這個症狀只在關機路徑上出現,平常跑得好好的。
+        // This pins disposal order, not send behaviour. The pipeline's limiter is a container-held singleton keyed
+        // by client name, and a container disposes in reverse order of creation — the whole basis for "a dependant
+        // is disposed before what it depends on". A facade that deferred building its handler chain to the first
+        // request would put the limiter into the disposal list later than the service sending through it, so at
+        // shutdown the limiter would go first and any service sending a farewell request from its own DisposeAsync
+        // (the Binance user data stream's DELETE of its listenKey, for one) would get an ObjectDisposedException —
+        // on the shutdown path only, with everything looking fine while running.
+        var services = new ServiceCollection();
+
+        services.AddHttpClient("exchange")
+            .AddOzakboyHttpPipeline(options =>
+            {
+                options.EnableSigning = false;
+                options.EnableRateLimiting = true;
+                options.RateLimiting.Buckets.Add(new RateLimitBucket("minute", 1_000, TimeSpan.FromMinutes(1)));
+            })
+            .ConfigurePrimaryHttpMessageHandler(() => StubHttpMessageHandler.AlwaysReturns(HttpStatusCode.OK, "bye"));
+
+        services.AddSingleton(provider => provider.CreateOzakboyHttpPipelineClient("exchange"));
+        services.AddSingleton<FarewellRequestService>();
+
+        FarewellRequestService service;
+
+        await using (var provider = services.BuildServiceProvider())
+        {
+            service = provider.GetRequiredService<FarewellRequestService>();
+
+            using var request = new HttpRequestMessage(HttpMethod.Get, "https://example.test/start");
+            var started = await service.Pipeline.SendAsync(request, CancellationToken.None);
+
+            Assert.IsTrue(started.TryGetValue(out var response));
+            response.Dispose();
+        }
+
+        Assert.IsTrue(
+            service.FarewellSucceeded,
+            $"容器釋放時的收尾請求沒有送出去:{service.FarewellError}。The farewell request sent during container disposal did not go out.");
     }
 
     [TestMethod]
