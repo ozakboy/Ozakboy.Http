@@ -33,7 +33,7 @@ retry → rate limiting → signing → sanitising logging → the network
 Two rules sit behind it: **every attempt is a new request**, and **a timestamp is the moment the request goes out**. Retry sits outermost, so the other three run again on every attempt:
 
 - **Rate limiting inside retry.** Every attempt pays its own weight. Outside retry, a request retried N times would pay once, and the local quota would under-count exactly when the error rate is high — which is when a weight-based ban (418) arrives. The backoff wait happens outside the limiter and holds no permit.
-- **Signing inside rate limiting.** A request is signed, and with `Signing.TimestampParameterName` set, stamped with the current time, only once its permit is held. Sign first and queue afterwards, and the timestamp ages in the queue: the limiter waits up to 30 seconds by default, while Binance's recvWindow is 5. Every retry is re-signed the same way.
+- **Signing inside rate limiting.** A request is signed, and with `Signing.TimestampParameterName` set, stamped with the current time, only once its permit is held. Sign first and queue afterwards, and the timestamp ages in the queue: the limiter waits up to 30 seconds by default, while Binance's recvWindow is 5. Every retry is re-signed the same way. The signing handler is also what writes `WithQueryParameters` into the URI; with `EnableSigning = false` an internal handler takes the same position and writes the parameters with the same order, encoding and replace-the-existing-query rule, only unsigned (before 0.3.3 an unsigned pipeline dropped them).
 - **Logging innermost.** It records what actually went out: admitted, signed, and which attempt it was.
 
 > **This order took two fixes.** 0.2.0 attached signing → rate limiting → retry → logging while its comments described the opposite, so retries reused a stale timestamp and paid no weight. A 0.3.0 draft then tried retry → signing → rate limiting, which signed requests before they queued, so one that queued past recvWindow was rejected on arrival (`-1021`). A wrong order raises no error, only hard-to-read runtime behaviour, so every point is pinned by a test. See the [changelog](CHANGELOG.md).
@@ -73,7 +73,7 @@ Besides attaching the four handlers, it changes three things on the named client
 - **It removes `IHttpClientFactory`'s default logging** (`RemoveAllLoggers()`). That logging writes the full URI at Information level, and .NET redacts the query, not the path — a credential in the path, like Telegram's `/bot<token>/`, goes straight into the log. The pipeline's own logging handler is masked and replaces it.
 - **It sets `HttpClient.Timeout` to infinite.** Timeouts belong to the pipeline: the retry handler bounds each attempt, `HttpPipelineClient` the whole exchange. The default 100 seconds, if shorter than `OverallTimeout`, would fire first as a cancellation, and a timeout would be misfiled as the caller cancelling. Any `Timeout` configured earlier is overridden.
 
-Each section can also be registered on its own — `AddRetry`, `AddWeightedRateLimiting`, `AddRequestSigning`, `AddSanitizedLogging` — in that order. Getting the order right is then your job.
+Each section can also be registered on its own — `AddRetry`, `AddWeightedRateLimiting`, `AddRequestSigning`, `AddSanitizedLogging` — in that order. Getting the order right is then your job. `AddRequestSigning` is also what writes `WithQueryParameters` into the URI, so a segmented pipeline without it sends no query parameters.
 
 ---
 

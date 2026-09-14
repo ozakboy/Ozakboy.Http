@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-14
+
+A pipeline with signing switched off sent none of its query parameters. They now go out, in exactly the order and
+encoding the signing path uses.
+
+關掉簽章的管線,query 參數一個都沒有送出。現在照常送出,順序與編碼與簽章路徑完全相同。
+
+### Fixed
+
+- **`AddOzakboyHttpPipeline` with `EnableSigning = false` silently dropped every parameter set with
+  `WithQueryParameters`.** `WithQueryParameters` only places the parameters in `HttpRequestMessage.Options`; the
+  one handler that ever wrote them into `RequestUri` was `SigningHandler`, and with signing off that handler is not
+  attached at all. The request still went out and a response still came back — the peer simply reported a missing
+  mandatory parameter, with nothing pointing at a parameter dropped locally. **Affected configuration:
+  `AddOzakboyHttpPipeline` with `EnableSigning = false`, for any request using `WithQueryParameters`.** Signing
+  pipelines were never affected. Downstream, a credential-free Binance production public market data client
+  (signing off on purpose) sent `GET /fapi/v1/klines` without `symbol` and got `-1102`; a backtest downloader
+  reproduced it against the live endpoint. With signing off, an internal handler now takes the signing handler's
+  position — inside rate limiting, outside logging, so the log records the URI actually sent — and writes the
+  parameters through the same `QueryParameters.ToQueryString()` and the same URI write rule the signing path uses,
+  now shared by both: a query already on the URI is replaced, not merged, and a request declaring no parameters
+  passes through untouched. With signing on, `SigningHandler` still writes the query, once.
+  `AddOzakboyHttpPipeline` 在 `EnableSigning = false` 時,`WithQueryParameters` 放進去的參數全部安靜地消失。
+  `WithQueryParameters` 只把參數放進 `HttpRequestMessage.Options`,真正把它們寫進 `RequestUri` 的一直只有
+  `SigningHandler`,而簽章關掉時那個處理器根本不掛。請求照樣送出、照樣拿到回應,只是對方回報缺少必要參數,
+  完全看不出是本地少送了東西。**受影響的組態:`AddOzakboyHttpPipeline` 且 `EnableSigning = false`,
+  凡是用了 `WithQueryParameters` 的請求。**有簽章的管線從未受影響。下游實際踩到的是不帶憑證、刻意關掉簽章的
+  幣安主網公開行情用戶端:`GET /fapi/v1/klines` 沒送出 `symbol`,對方回 `-1102`,回測下載器實跑重現。
+  現在簽章關閉時,同一個位置(限流之內、日誌之外,日誌記到的因此是實際送出的位址)改掛一個內部處理器,
+  以同一個 `QueryParameters.ToQueryString()`、同一份與簽章路徑共用的寫入規則寫入參數:位址上原有的 query
+  被換掉而不是合併,沒有宣告參數的請求原封不動。簽章開啟時仍由 `SigningHandler` 寫入,只寫一次。
+
+### Notes
+
+- **Segmented registration is unchanged.** `AddRequestSigning` still writes the query; a pipeline assembled section
+  by section without it still sends no query parameters, and the README now says so.
+  分段註冊的行為不變:`AddRequestSigning` 照樣寫入 query;分段組裝時沒掛它,query 參數一樣不會送出,README 已補上這一句。
+- **An unsigned pipeline does not sign.** A request marked `WithSignature` on it gets its parameters written but no
+  signature and no API-key header — the same meaning "no signing handler" always had.
+  未簽章管線不簽章:在它上面標了 `WithSignature` 的請求,參數照樣寫入,但不帶簽章也不帶 API 金鑰標頭,
+  與「不掛簽章處理器」一向的語意相同。
+- **Verified by breaking it on purpose.** With the branch that attaches the new handler removed, five of the new
+  tests go red — the URI goes out with no query, or keeps its stale one; restoring it turns them green.
+  故意弄壞驗證過:拿掉掛上新處理器的那一段,新測試有五條變紅(位址不帶 query,或原有的 query 沒被換掉);改回來即綠。
+- 232 tests, all green (222 from 0.3.2 plus 10 new). No public signature changed.
+  232 個測試全綠(0.3.2 的 222 條加 10 條新的)。沒有任何公開簽章被改動。
+- Targets `net10.0`. Dependencies unchanged; no third-party package anywhere in the transitive graph.
+  相依不變,遞移相依樹中仍無任何第三方套件。
+
 ## [0.3.2] - 2026-09-14
 
 A service that sends a farewell request from its own `DisposeAsync` got an `ObjectDisposedException` instead. The
@@ -405,7 +454,8 @@ dependency graph. Written for an automated trading engine, but nothing about tra
   the third-party `Polly.Core`.
   刻意排除 `Microsoft.Extensions.Http.Resilience`(遞移相依第三方的 `Polly.Core`)。
 
-[Unreleased]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.2.0...v0.3.0

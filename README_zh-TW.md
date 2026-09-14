@@ -33,7 +33,7 @@ dotnet add package Ozakboy.Http
 背後的原則有兩條:**每一次嘗試都是一個新請求**,以及**時間戳要是送出那一刻的**。重試放在最外層,其餘三段在每一次嘗試都重新執行一遍:
 
 - **限流在重試之內**:每次嘗試各付一份權重。放在重試外層的話,重試 N 次只付一份,本地配額正好在錯誤率高的時候低估實際用量 —— 以權重計算封鎖(418)的服務,就是在那個時候封你。退避等待發生在限流器之外,不持有任何許可。
-- **簽章在限流之內**:拿到許可之後才簽章;設定 `Signing.TimestampParameterName` 後,時間戳也在這時才蓋上當下時間。先簽再排隊,時間戳就在隊伍裡過期 —— 限流等待上限預設 30 秒,幣安的 recvWindow 只有 5 秒。每次重試都照這樣重新簽一次。
+- **簽章在限流之內**:拿到許可之後才簽章;設定 `Signing.TimestampParameterName` 後,時間戳也在這時才蓋上當下時間。先簽再排隊,時間戳就在隊伍裡過期 —— 限流等待上限預設 30 秒,幣安的 recvWindow 只有 5 秒。每次重試都照這樣重新簽一次。把 `WithQueryParameters` 的參數寫進位址也是簽章處理器的工作;`EnableSigning = false` 時,同一個位置改掛一個內部處理器,以相同的順序、編碼與「換掉原有 query」的規則寫入參數,只是不簽章(0.3.3 以前,未簽章管線會把參數整個丟掉)。
 - **日誌在最內層**:記下真正送出去的那一份 —— 已放行、已簽章、第幾次嘗試。
 
 > **這個順序是修了兩次才定下來的。** 0.2.0 依「簽章 → 限流 → 重試 → 日誌」掛上,註解描述的卻是另一回事,結果是重試帶著過期的時間戳出去、而且不付權重。0.3.0 開發中先改成「重試 → 簽章 → 限流」,變成先簽章再排隊,排隊超過 recvWindow 的請求一出去就被拒絕(`-1021`)。順序錯了不會有任何錯誤訊息,只會在執行期表現成難以理解的行為,所以每一點都有測試鎖住。詳見 [CHANGELOG](CHANGELOG.md)。
@@ -73,7 +73,7 @@ services.AddSingleton(provider => provider.CreateOzakboyHttpPipelineClient("exch
 - **移除 `IHttpClientFactory` 預設的日誌**(`RemoveAllLoggers()`)。那組日誌在 Information 層級寫出完整位址,而 .NET 只遮 query、不遮路徑 —— 憑證放在路徑裡的服務(例如 Telegram 的 `/bot<token>/`)就直接寫進日誌了。本套件自己的日誌處理器已經過遮罩,取代它們。
 - **把 `HttpClient.Timeout` 設為無限。** 逾時交給管線:重試處理器管單次嘗試,`HttpPipelineClient` 管整趟。預設的 100 秒若短於 `OverallTimeout`,會先觸發並表現成取消,逾時就被錯歸為「呼叫端取消」。先前自行設定的 `Timeout` 會被覆蓋。
 
-每一段也可以單獨註冊 —— `AddRetry`、`AddWeightedRateLimiting`、`AddRequestSigning`、`AddSanitizedLogging`,請照這個順序掛上;分段註冊時,順序正確與否由你負責。
+每一段也可以單獨註冊 —— `AddRetry`、`AddWeightedRateLimiting`、`AddRequestSigning`、`AddSanitizedLogging`,請照這個順序掛上;分段註冊時,順序正確與否由你負責。`AddRequestSigning` 同時負責把 `WithQueryParameters` 的參數寫進位址,分段組裝時沒掛它,query 參數就不會送出。
 
 ---
 

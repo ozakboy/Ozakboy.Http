@@ -40,6 +40,15 @@ namespace Ozakboy.Http.Signing;
 /// URI, so public and private endpoints are assembled the same way and callers need no second style for
 /// "this one is unsigned".
 /// </para>
+/// <para>
+/// 關掉簽章的管線(<see cref="HttpPipelineOptions.EnableSigning"/> 為 <see langword="false"/>)不掛這個處理器,
+/// 由內部的 <see cref="QueryParametersHandler"/> 在同一個位置把參數寫進位址。0.3.2 以前沒有那一段,
+/// 未簽章管線的 query 參數因此完全沒有送出。
+/// A pipeline with signing switched off (<see cref="HttpPipelineOptions.EnableSigning"/> set to
+/// <see langword="false"/>) does not attach this handler; the internal <see cref="QueryParametersHandler"/> writes
+/// the parameters into the URI from the same position instead. Up to 0.3.2 nothing took that place, and an
+/// unsigned pipeline sent none of its query parameters at all.
+/// </para>
 /// </remarks>
 public sealed class SigningHandler : DelegatingHandler
 {
@@ -173,45 +182,11 @@ public sealed class SigningHandler : DelegatingHandler
         }
         else
         {
-            request.RequestUri = ReplaceQuery(request.RequestUri, payload);
+            // 與未簽章管線的 QueryParametersHandler 共用同一份寫入規則,兩邊送出的位址才會逐字一致。
+            // Shares its write rule with QueryParametersHandler on unsigned pipelines, so both send the same URI.
+            request.RequestUri = RequestUriQuery.Replace(request.RequestUri, payload);
         }
 
         return base.SendAsync(request, cancellationToken);
-    }
-
-    /// <summary>
-    /// 換掉位址的 query 部分,保留 scheme、authority 與路徑。
-    /// Replaces the query part of a URI, keeping the scheme, authority, and path.
-    /// </summary>
-    /// <param name="uri">原位址,允許相對位址。The original URI; relative URIs are accepted.</param>
-    /// <param name="query">已編碼的 query 字串(不含 <c>?</c>)。The encoded query string, without the <c>?</c>.</param>
-    /// <returns>換好 query 的位址。The URI with the new query.</returns>
-    /// <remarks>
-    /// 刻意不用 <see cref="UriBuilder"/>:它會重新組裝位址,而我們需要的是送出的字串與簽過的字串
-    /// 逐字相同。這裡以字串層級直接接上,而 <see cref="Uri.EscapeDataString(string)"/> 不會編碼未保留字元,
-    /// 因此 <see cref="Uri"/> 也不會把我們的 <c>%XX</c> 還原回去。
-    /// <see cref="UriBuilder"/> is avoided on purpose: it reassembles the URI, and what this needs is a string
-    /// that matches the signed one exactly. The query is concatenated at the string level instead, and since
-    /// <see cref="Uri.EscapeDataString(string)"/> never escapes unreserved characters, <see cref="Uri"/> has
-    /// nothing of ours to unescape back.
-    /// </remarks>
-    private static Uri ReplaceQuery(Uri? uri, string query)
-    {
-        if (uri is null)
-        {
-            throw Error.Validation(
-                HttpErrorCodes.SigningMissingRequestUri,
-                "請求沒有目標位址,無法附加參數。The request has no target URI, so parameters cannot be attached.").ToException();
-        }
-
-        var text = uri.IsAbsoluteUri ? uri.GetLeftPart(UriPartial.Path) : uri.OriginalString;
-        var separator = text.IndexOf('?', StringComparison.Ordinal);
-        if (separator >= 0)
-        {
-            text = text[..separator];
-        }
-
-        var target = query.Length == 0 ? text : $"{text}?{query}";
-        return new Uri(target, uri.IsAbsoluteUri ? UriKind.Absolute : UriKind.Relative);
     }
 }

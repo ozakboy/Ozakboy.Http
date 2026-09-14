@@ -44,6 +44,11 @@ namespace Ozakboy.Http;
 /// <b>Signing is inside rate limiting</b>: the request is signed and stamped only once the permit is held. Sign
 /// first and queue afterwards, and the timestamp ages in the queue — the limiter waits up to 30 seconds by
 /// default, while Binance's recvWindow defaults to 5.
+/// 簽章處理器同時負責把 <c>WithQueryParameters</c> 的參數寫進位址;<see cref="HttpPipelineOptions.EnableSigning"/>
+/// 關掉時,同一個位置改掛只寫參數、不簽章的內部處理器,寫入規則與簽章路徑共用同一份。
+/// The signing handler is also what writes <c>WithQueryParameters</c> into the URI; with
+/// <see cref="HttpPipelineOptions.EnableSigning"/> off, the same position takes an internal handler that writes the
+/// parameters without signing, sharing its write rule with the signing path.
 /// </description></item>
 /// <item><description>
 /// <b>日誌在最內層</b>:記下真正送出去的那一份(已放行、已簽章、第幾次嘗試)。
@@ -166,6 +171,15 @@ public static class OzakboyHttpClientBuilderExtensions
         if (options.EnableSigning)
         {
             builder.AddHttpMessageHandler(provider => new SigningHandler(options.Signing, provider.GetService<TimeProvider>()));
+        }
+        else
+        {
+            // 簽章處理器同時負責把 WithQueryParameters 的參數寫進位址;不掛它時,這個位置必須有人接手,
+            // 否則未簽章管線上的 query 參數一個都不會送出(0.3.2 以前正是如此)。寫入規則與簽章處理器共用同一份。
+            // The signing handler is also what writes WithQueryParameters into the URI; without it something has to
+            // take this position, or no query parameter on an unsigned pipeline goes out at all — exactly the case up
+            // to 0.3.2. The write rule is shared with the signing handler.
+            builder.AddHttpMessageHandler(_ => new QueryParametersHandler());
         }
 
         builder.AddHttpMessageHandler(provider => new SanitizingLoggingHandler(

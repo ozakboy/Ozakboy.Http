@@ -25,6 +25,13 @@ public sealed class HttpPipelineOptions
     /// 是否加入簽章處理器。
     /// Whether to add the signing handler.
     /// </summary>
+    /// <remarks>
+    /// 關掉時,<c>WithQueryParameters</c> 的參數仍會以與簽章路徑相同的順序、編碼與寫入規則送出(0.3.3 起);
+    /// 只是不會帶簽章與 API 金鑰標頭。0.3.2 以前關掉簽章會連 query 參數一起丟掉。
+    /// When off, parameters set with <c>WithQueryParameters</c> still go out, in the same order, with the same
+    /// encoding and under the same write rule as on the signing path (from 0.3.3); they simply carry no signature
+    /// and no API-key header. Up to 0.3.2, switching signing off dropped the query parameters as well.
+    /// </remarks>
     public bool EnableSigning { get; set; } = true;
 
     /// <summary>
