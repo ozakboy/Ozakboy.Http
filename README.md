@@ -189,7 +189,7 @@ There is a second construction path for pipelines assembled by hand, outside a s
 
 ## Testing
 
-`dotnet test` runs 215 tests with no network and no `Thread.Sleep`. The pipeline order is pinned by tests that go red under the 0.2.0 order and under the signing-before-rate-limiting draft, and a canary secret is walked through the failure paths to check every log form and every field of the returned error. Signing is pinned to golden vectors published in the Binance documentation, with counter-proofs that parameter order and encoding order really do change the result. Rate limiting and retry timing run on `FakeTimeProvider`.
+`dotnet test` runs 232 tests with no network and no `Thread.Sleep`. The pipeline order is pinned by tests that go red under the 0.2.0 order and under the signing-before-rate-limiting draft, and a canary secret is walked through the failure paths to check every log form and every field of the returned error. Signing is pinned to golden vectors published in the Binance documentation, with counter-proofs that parameter order and encoding order really do change the result. Rate limiting and retry timing run on `FakeTimeProvider`.
 
 ---
 

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Documentation fix: the Testing section of both READMEs still said `dotnet test` runs 215 tests, a figure left over
+  from an earlier release. The current suite runs 232 (`dotnet test --solution Ozakboy.Http.sln -c Release`, all
+  green), which is what the READMEs now say. No code changed.
+  文件更正:README 兩版的「測試」一節仍寫 `dotnet test` 跑 215 個測試,那是前幾版留下的數字。目前的測試套件實跑
+  232 個(`dotnet test --solution Ozakboy.Http.sln -c Release`,全綠),README 已改成這個數字。程式碼未變。
+
 ## [0.3.3] - 2026-09-14
 
 A pipeline with signing switched off sent none of its query parameters. They now go out, in exactly the order and
