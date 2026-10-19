@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-10-19
+
+An unsuccessful response is no longer a warning by default. It is logged at Information, except 5xx, 429 and 418,
+which stay at Warning. **This changes what existing callers see in their logs**; one line restores the old
+behaviour.
+
+非成功回應預設不再記成警告:改記 Information,只有 5xx、429、418 維持 Warning。**既有呼叫端的日誌輸出會因此改變**,
+要舊行為只需要一行設定。
+
+### Changed
+
+- **Default level of event 1003 ("HTTP 回應非成功") changed from Warning to Information, with 5xx, 429 and 418
+  kept at Warning.** Up to 0.3.3 every non-2xx response was a Warning. Against an exchange, most 4xx answers are
+  expected business outcomes — querying an order that was already cancelled, a reduce-only order refused because
+  the position is gone — and a downstream 72-hour soak run found them burying the warnings that mattered. The
+  official `LoggingHttpMessageHandler` logs every response at Information regardless of status code; this
+  package now does the same for ordinary failures, and keeps Warning only for the answers that mean the peer is
+  in trouble (5xx) or the client's pacing has gone wrong (429 rate limited, 418 banned after ignoring 429). The
+  event id, message template and structured fields (`Method`, `Uri`, `StatusCode`, `ElapsedMilliseconds`) are
+  unchanged — only the level moves. Successful responses are unaffected and stay at Debug (event 1002).
+  **To get the 0.3.3 behaviour back** — every unsuccessful response at Warning — set
+  `options.Logging.UnsuccessfulResponseLevel = LogLevel.Warning` (or the same property on the
+  `RequestLoggingOptions` passed to `AddSanitizedLogging` / `SanitizingLoggingHandler`).
+  事件 1003(「HTTP 回應非成功」)的預設等級由 Warning 改為 Information,5xx、429、418 維持 Warning。0.3.3 以前,
+  所有非 2xx 回應一律是 Warning;但對交易所而言,大部分 4xx 是業務上預期得到的結果 —— 查一張已經撤掉的單、
+  部位已經不在時被拒絕的只減倉單 —— 下游一次 72 小時壓測發現它們把真正該看的警告淹沒了。官方的
+  `LoggingHttpMessageHandler` 不論狀態碼一律記 Information;本套件現在對一般的失敗也這樣做,只保留兩種回答為
+  Warning:對方自己出了狀況(5xx),或用戶端的送出節奏出了問題(429 限流、418 無視 429 之後被封鎖)。
+  事件編號、訊息格式與結構化欄位(`Method`、`Uri`、`StatusCode`、`ElapsedMilliseconds`)都不變,只換等級。
+  成功回應不受影響,仍是 Debug(事件 1002)。**要回到 0.3.3 的行為**(所有非成功回應都是 Warning):
+  設定 `options.Logging.UnsuccessfulResponseLevel = LogLevel.Warning`(分段註冊時,設在交給 `AddSanitizedLogging`
+  或 `SanitizingLoggingHandler` 的那份 `RequestLoggingOptions` 上)。
+
+### Added
+
+- **`RequestLoggingOptions.UnsuccessfulResponseLevel`** (default `LogLevel.Information`): the level for an
+  unsuccessful response that is not elevated.
+  非成功回應的一般記錄等級,預設 `Information`。
+- **`RequestLoggingOptions.ElevatedResponseLevel`** (default `LogLevel.Warning`): the level for an elevated one.
+  升級的非成功回應所用的等級,預設 `Warning`。
+- **`RequestLoggingOptions.ElevateServerErrors`** (default `true`): whether every 5xx is elevated.
+  是否把所有 5xx 升級,預設開啟。
+- **`RequestLoggingOptions.ElevatedStatusCodes`** (default `{ 418, 429 }`): further codes to elevate; add to it
+  or trim it. `ElevateServerErrors = false` plus `ElevatedStatusCodes.Clear()` puts every unsuccessful response on
+  the general level.
+  另外要升級的狀態碼,預設 418 與 429,可增可刪;`ElevateServerErrors = false` 再加上 `ElevatedStatusCodes.Clear()`,
+  所有非成功回應就都用一般等級。
+- `LogLevel.None` on either level means "not logged". `Validate()` rejects an undefined `LogLevel` value and any
+  elevated status code outside 100–999. A handler copies these settings when it is constructed, so changing the
+  options afterwards does not reach a handler already built (with `AddOzakboyHttpPipeline`, the next handler
+  `IHttpClientFactory` builds picks the change up).
+  兩個等級設成 `LogLevel.None` 表示不記錄。`Validate()` 會擋下未定義的 `LogLevel` 值,以及超出 100–999 的升級狀態碼。
+  處理器在建構當下複製這些設定,之後再改設定不會影響已建立的處理器(`AddOzakboyHttpPipeline` 下,
+  `IHttpClientFactory` 下一次重建的處理器會拿到新值)。
+
+### Notes
+
+- **Why a patch release for a visible behaviour change.** The package is still 0.x, no public signature changed
+  or was removed, and the change only lowers the level of entries a caller did not ask to be warnings; the
+  release was decided as 0.3.4 on that basis. If you alert on Warning-level event 1003 for 4xx codes, either
+  restore the old level as above or add those codes to `ElevatedStatusCodes`.
+  為什麼可觀察的行為變更只升 Patch:套件仍在 0.x,沒有任何公開簽章被改動或移除,變更只是把呼叫端沒要求當警告的
+  紀錄降一級,據此定為 0.3.4。若你以 Warning 等級的事件 1003 對 4xx 設了告警,請照上面的方式改回舊等級,
+  或把那些狀態碼加進 `ElevatedStatusCodes`。
+- **Verified by breaking it on purpose.** Hard-coding the level back to Warning turns 11 tests red (every 4xx
+  default, every override that lowers a level, the pipeline-level 404); dropping the elevation turns 11 red
+  (every 5xx / 429 / 418 default, the added code, the custom elevated level, the pipeline-level 503); reading the
+  options live instead of the construction-time copy, and removing the status-code range check, turn 4 red.
+  Restoring each turns them green.
+  故意弄壞驗證過:把等級寫死回 Warning,11 條測試變紅(所有 4xx 預設、所有把等級調低的覆寫、管線層級的 404);
+  拿掉升級判斷,11 條變紅(所有 5xx / 429 / 418 預設、新增的狀態碼、自訂升級等級、管線層級的 503);
+  改成每次讀活的設定而非建構時的副本、以及拿掉狀態碼範圍檢查,4 條變紅。逐一改回即全綠。
+- 263 tests, all green (232 in 0.3.3, plus 31 net new; the old single-case 429 test is now one row of the
+  data-driven elevation test). No public signature changed; four properties were added.
+  263 個測試全綠(0.3.3 的 232 條,淨增 31 條;原本只測 429 的那一條併入升級測試的資料列)。沒有任何公開簽章被改動,
+  新增四個屬性。
+- Targets `net10.0`. Dependencies unchanged; no third-party package anywhere in the transitive graph.
+  相依不變,遞移相依樹中仍無任何第三方套件。
+
 ## [0.3.3] - 2026-09-14
 
 A pipeline with signing switched off sent none of its query parameters. They now go out, in exactly the order and
@@ -454,7 +533,8 @@ dependency graph. Written for an automated trading engine, but nothing about tra
   the third-party `Polly.Core`.
   刻意排除 `Microsoft.Extensions.Http.Resilience`(遞移相依第三方的 `Polly.Core`)。
 
-[Unreleased]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ozakboy/Ozakboy.Http/compare/v0.3.0...v0.3.1

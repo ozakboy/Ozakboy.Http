@@ -1,5 +1,7 @@
 using System.Net;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Ozakboy.Http.Logging;
 using Ozakboy.Http.RateLimiting;
 using Ozakboy.Http.Signing;
 using Ozakboy.Http.Tests.TestSupport;
@@ -168,6 +170,65 @@ public sealed class PipelineIntegrationTests
         using var response = await client.SendAsync(request, CancellationToken.None);
 
         Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [TestMethod]
+    [DataRow(404, LogLevel.Information)]
+    [DataRow(503, LogLevel.Warning)]
+    public async Task Pipeline_UnsuccessfulResponse_UsesTheConfiguredLevelWithStructuredFieldsIntact(int statusCode, LogLevel expected)
+    {
+        var entry = await SendThroughPipelineAndCaptureUnsuccessfulAsync(statusCode, _ => { });
+
+        Assert.AreEqual(expected, entry.Level);
+        StringAssert.Contains(entry.State, $"StatusCode={statusCode}", StringComparison.Ordinal);
+        StringAssert.Contains(entry.State, "Method=GET", StringComparison.Ordinal);
+        StringAssert.Contains(entry.State, "ElapsedMilliseconds=", StringComparison.Ordinal);
+    }
+
+    [TestMethod]
+    public async Task Pipeline_LoggingOverrideInPipelineOptions_ReachesTheHandler()
+    {
+        var entry = await SendThroughPipelineAndCaptureUnsuccessfulAsync(
+            404,
+            logging => logging.UnsuccessfulResponseLevel = LogLevel.Warning);
+
+        Assert.AreEqual(LogLevel.Warning, entry.Level);
+    }
+
+    private static async Task<CapturedEntry> SendThroughPipelineAndCaptureUnsuccessfulAsync(int statusCode, Action<RequestLoggingOptions> configureLogging)
+    {
+        var capture = new CapturingLoggerProvider();
+        var stub = StubHttpMessageHandler.AlwaysReturns((HttpStatusCode)statusCode);
+
+        var services = new ServiceCollection();
+        services.AddSingleton<TimeProvider>(new FakeTimeProvider());
+        services.AddLogging(logging =>
+        {
+            logging.ClearProviders();
+            logging.AddProvider(capture);
+            logging.SetMinimumLevel(LogLevel.Trace);
+        });
+        services.AddHttpClient("levels")
+            .ConfigurePrimaryHttpMessageHandler(() => stub)
+            .AddOzakboyHttpPipeline(options =>
+            {
+                options.EnableSigning = false;
+                options.EnableRateLimiting = false;
+                options.Retry.Policy = new RetryPolicy { MaxAttempts = 1 };
+                configureLogging(options.Logging);
+            });
+
+        using var provider = services.BuildServiceProvider();
+        using var client = provider.GetRequiredService<IHttpClientFactory>().CreateClient("levels");
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, "https://example.test/api/order");
+        using var response = await client.SendAsync(request, CancellationToken.None);
+
+        var matches = capture.Entries
+            .Where(entry => entry.Message.StartsWith("HTTP 回應非成功 ", StringComparison.Ordinal))
+            .ToList();
+        Assert.HasCount(1, matches);
+        return matches[0];
     }
 
     private static RateLimitOptions BuildRateLimitOptions(int limit, TimeSpan window)

@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Ozakboy.Http.Logging;
 using Ozakboy.Http.RateLimiting;
 using Ozakboy.Http.Retry;
@@ -121,6 +122,50 @@ public sealed class OptionsValidationTests
     {
         var options = new RequestLoggingOptions();
         options.AdditionalSensitiveParameterNames.Add("  ");
+
+        AssertInvalid(options.Validate());
+    }
+
+    [TestMethod]
+    public void RequestLoggingOptions_Defaults_ElevateServerErrorsAndRateLimits()
+    {
+        var options = new RequestLoggingOptions();
+
+        Assert.AreEqual(LogLevel.Information, options.UnsuccessfulResponseLevel);
+        Assert.AreEqual(LogLevel.Warning, options.ElevatedResponseLevel);
+        Assert.IsTrue(options.ElevateServerErrors);
+        Assert.IsTrue(options.ElevatedStatusCodes.SetEquals([418, 429]));
+    }
+
+    [TestMethod]
+    public void RequestLoggingOptions_UndefinedUnsuccessfulLevel_IsInvalid() =>
+        AssertInvalid(new RequestLoggingOptions { UnsuccessfulResponseLevel = (LogLevel)42 }.Validate());
+
+    [TestMethod]
+    public void RequestLoggingOptions_UndefinedElevatedLevel_IsInvalid() =>
+        AssertInvalid(new RequestLoggingOptions { ElevatedResponseLevel = (LogLevel)(-1) }.Validate());
+
+    [TestMethod]
+    public void RequestLoggingOptions_LevelNone_IsValid() =>
+        Assert.IsTrue(new RequestLoggingOptions { UnsuccessfulResponseLevel = LogLevel.None, ElevatedResponseLevel = LogLevel.None }.Validate().IsSuccess);
+
+    [TestMethod]
+    [DataRow(99)]
+    [DataRow(1000)]
+    [DataRow(-429)]
+    public void RequestLoggingOptions_ElevatedStatusCodeOutOfRange_IsInvalid(int statusCode)
+    {
+        var options = new RequestLoggingOptions();
+        options.ElevatedStatusCodes.Add(statusCode);
+
+        AssertInvalid(options.Validate());
+    }
+
+    [TestMethod]
+    public void HttpPipelineOptions_InvalidLoggingLevel_IsInvalid()
+    {
+        var options = new HttpPipelineOptions { EnableRateLimiting = false, EnableSigning = false };
+        options.Logging.UnsuccessfulResponseLevel = (LogLevel)42;
 
         AssertInvalid(options.Validate());
     }

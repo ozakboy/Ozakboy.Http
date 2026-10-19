@@ -156,6 +156,41 @@ HTTP 送出 GET https://api.example.com/fapi/v1/order?symbol=BTCUSDT&apiKey=vmPU
 
 **例外物件本身永遠不會交給記錄器,也不會放進 `Error`。** 連線層例外的訊息常帶著請求位址,而例外物件是遮不了的:`Message` 唯讀、內層例外鏈改不動。所以記錄器拿到的是 `SanitizedException` —— 原始型別名稱、遮罩後的訊息、遮罩後含堆疊的 `ToString()` —— 本套件產生的每一個 `Error.Exception` 也是它,`Error.Message` 與 `Error.Data` 則經過同一道字面替換。欄位名規則碰不到路徑段與例外訊息,只有登記過的值攔得住,這就是管線會替你登記簽章金鑰、以及 `KnownSecrets` 存在的原因。
 
+### 記錄等級
+
+| 事件 | 內容 | 等級 |
+| --- | --- | --- |
+| 1000 / 1001 | 送出請求 / 請求內容 | Debug |
+| 1002 | 成功回應 | Debug |
+| 1003 | 非成功回應 | 預設 Information;**5xx、429、418 為 Warning**(可調整,見下方) |
+| 1004 | 回應內容 | Debug |
+| 1005 | 連線失敗、逾時或取消(根本沒有回應) | Error |
+
+大部分 4xx 是預期得到的結果 —— 查一張已經撤掉的單、被拒絕的只減倉單 —— 每一筆都記成警告,只會把真正該看的淹沒。因此自 0.3.4 起,一般的非成功回應記為 Information,與官方的 `LoggingHttpMessageHandler` 一致;Warning 只留給兩種回答:對方自己出了狀況(5xx),或用戶端的送出節奏出了問題(429 限流、418 無視 429 之後被封鎖)。不論等級為何,事件編號、訊息與結構化欄位都相同。全部設定都在 `RequestLoggingOptions` 上(`AddOzakboyHttpPipeline` 裡是 `options.Logging`):
+
+```csharp
+.AddOzakboyHttpPipeline(options =>
+{
+    // 回到 0.3.3 的行為:所有非成功回應都是 Warning。
+    options.Logging.UnsuccessfulResponseLevel = LogLevel.Warning;
+
+    // 或微調:409 也升級,並把升級的那些提高到 Error。
+    options.Logging.ElevatedStatusCodes.Add(409);
+    options.Logging.ElevatedResponseLevel = LogLevel.Error;
+
+    // 或完全不升級:options.Logging.ElevateServerErrors = false; options.Logging.ElevatedStatusCodes.Clear();
+});
+```
+
+| 設定 | 預設 | 意義 |
+| --- | --- | --- |
+| `UnsuccessfulResponseLevel` | `Information` | 不屬於升級對象的非成功回應所用的等級 |
+| `ElevatedResponseLevel` | `Warning` | 升級的非成功回應所用的等級 |
+| `ElevateServerErrors` | `true` | 所有 5xx 都升級 |
+| `ElevatedStatusCodes` | `{ 418, 429 }` | 另外要升級的狀態碼(100–999) |
+
+兩個等級設成 `LogLevel.None` 表示不記錄。處理器在建立當下複製這些設定;使用 `AddOzakboyHttpPipeline` 時,之後的改動會在 `IHttpClientFactory` 下一次重建處理器時生效。
+
 ---
 
 ## 失敗一律回傳 `Result<T>`
@@ -189,7 +224,7 @@ if (!result.TryGetValue(out var body))
 
 ## 測試
 
-`dotnet test` 跑 215 個測試,全程不連網、沒有任何 `Thread.Sleep`。管線順序由「在 0.2.0 順序、以及先簽章再限流的開發中順序下都會變紅」的測試鎖住;另有一個可辨識的假祕密走過所有失敗路徑,檢查每一種日誌形式與回傳錯誤的每一個欄位。簽章以幣安官方文件公佈的黃金向量鎖死,另有反證測試證明參數順序與編碼順序確實會改變結果。限流與重試的時間行為跑在 `FakeTimeProvider` 上。
+`dotnet test` 跑 263 個測試,全程不連網、沒有任何 `Thread.Sleep`。管線順序由「在 0.2.0 順序、以及先簽章再限流的開發中順序下都會變紅」的測試鎖住;另有一個可辨識的假祕密走過所有失敗路徑,檢查每一種日誌形式與回傳錯誤的每一個欄位。簽章以幣安官方文件公佈的黃金向量鎖死,另有反證測試證明參數順序與編碼順序確實會改變結果。限流與重試的時間行為跑在 `FakeTimeProvider` 上。
 
 ---
 

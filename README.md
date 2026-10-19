@@ -156,6 +156,41 @@ Masking is `Ozakboy.Security`'s `SecretMasker`, whose default name list already 
 
 **Exceptions never reach a logger, or an `Error`, as themselves.** A transport exception's message often carries the request URI, and an exception object cannot be masked: `Message` is read-only and the inner chain cannot be rewritten. So the logger receives a `SanitizedException` instead — the original type name, the masked message, and the masked `ToString()` with its stack — and every `Error.Exception` this package produces is one too, with `Error.Message` and `Error.Data` passed through the same replacement. Name rules cannot reach a path segment or an exception message; only registered values can, which is why the pipeline registers the signing keys for you and `KnownSecrets` exists.
 
+### Log levels
+
+| Event | What | Level |
+| --- | --- | --- |
+| 1000 / 1001 | Request sent / request body | Debug |
+| 1002 | Successful response | Debug |
+| 1003 | Unsuccessful response | Information by default; **Warning for 5xx, 429 and 418** (configurable, see below) |
+| 1004 | Response body | Debug |
+| 1005 | Transport failure, timeout or cancellation (no response at all) | Error |
+
+Most 4xx answers are expected outcomes — querying an order that was already cancelled, a reduce-only order refused — and logging each one as a warning buries the ones that matter, so since 0.3.4 an ordinary unsuccessful response is Information, as with the official `LoggingHttpMessageHandler`. Warning is kept for answers that mean the peer is in trouble (5xx) or the client's pacing has gone wrong (429 rate limited, 418 banned for ignoring 429). The event id, message and structured fields are the same whatever the level. All of it is set on `RequestLoggingOptions` (`options.Logging` in `AddOzakboyHttpPipeline`):
+
+```csharp
+.AddOzakboyHttpPipeline(options =>
+{
+    // Back to the 0.3.3 behaviour: every unsuccessful response is a Warning.
+    options.Logging.UnsuccessfulResponseLevel = LogLevel.Warning;
+
+    // Or fine-tune: also elevate 409, and raise the elevated ones to Error.
+    options.Logging.ElevatedStatusCodes.Add(409);
+    options.Logging.ElevatedResponseLevel = LogLevel.Error;
+
+    // Or elevate nothing: options.Logging.ElevateServerErrors = false; options.Logging.ElevatedStatusCodes.Clear();
+});
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `UnsuccessfulResponseLevel` | `Information` | Level for an unsuccessful response that is not elevated |
+| `ElevatedResponseLevel` | `Warning` | Level for an elevated one |
+| `ElevateServerErrors` | `true` | Elevate every 5xx |
+| `ElevatedStatusCodes` | `{ 418, 429 }` | Further codes to elevate (100–999) |
+
+`LogLevel.None` on either level means "not logged". A handler copies these settings when it is built; with `AddOzakboyHttpPipeline`, a later change reaches the next handler `IHttpClientFactory` builds.
+
 ---
 
 ## Failures come back as `Result<T>`
@@ -189,7 +224,7 @@ There is a second construction path for pipelines assembled by hand, outside a s
 
 ## Testing
 
-`dotnet test` runs 215 tests with no network and no `Thread.Sleep`. The pipeline order is pinned by tests that go red under the 0.2.0 order and under the signing-before-rate-limiting draft, and a canary secret is walked through the failure paths to check every log form and every field of the returned error. Signing is pinned to golden vectors published in the Binance documentation, with counter-proofs that parameter order and encoding order really do change the result. Rate limiting and retry timing run on `FakeTimeProvider`.
+`dotnet test` runs 263 tests with no network and no `Thread.Sleep`. The pipeline order is pinned by tests that go red under the 0.2.0 order and under the signing-before-rate-limiting draft, and a canary secret is walked through the failure paths to check every log form and every field of the returned error. Signing is pinned to golden vectors published in the Binance documentation, with counter-proofs that parameter order and encoding order really do change the result. Rate limiting and retry timing run on `FakeTimeProvider`.
 
 ---
 

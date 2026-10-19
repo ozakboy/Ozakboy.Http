@@ -1,3 +1,4 @@
+using System.Collections.Frozen;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Ozakboy.Core.Abstractions;
@@ -38,6 +39,10 @@ public sealed partial class SanitizingLoggingHandler : DelegatingHandler
     private readonly RequestLoggingOptions _options;
     private readonly SecretMasker _masker;
     private readonly TimeProvider _timeProvider;
+    private readonly LogLevel _unsuccessfulResponseLevel;
+    private readonly LogLevel _elevatedResponseLevel;
+    private readonly bool _elevateServerErrors;
+    private readonly FrozenSet<int> _elevatedStatusCodes;
 
     /// <summary>
     /// 建立處理器。
@@ -101,6 +106,15 @@ public sealed partial class SanitizingLoggingHandler : DelegatingHandler
         _options = effectiveOptions;
         _masker = masker ?? effectiveOptions.CreateMasker();
         _timeProvider = timeProvider ?? TimeProvider.System;
+
+        // 等級設定在建構當下複製一份:驗證過的就是用到的,而且之後並行讀取的是不可變的副本,
+        // 不會與呼叫端事後改動那份可變名單互相踩到。
+        // The level settings are copied at construction: what was validated is what gets used, and concurrent
+        // requests read an immutable copy that cannot collide with the caller mutating the set afterwards.
+        _unsuccessfulResponseLevel = effectiveOptions.UnsuccessfulResponseLevel;
+        _elevatedResponseLevel = effectiveOptions.ElevatedResponseLevel;
+        _elevateServerErrors = effectiveOptions.ElevateServerErrors;
+        _elevatedStatusCodes = effectiveOptions.ElevatedStatusCodes.ToFrozenSet();
     }
 
     /// <summary>
@@ -165,7 +179,11 @@ public sealed partial class SanitizingLoggingHandler : DelegatingHandler
             }
             else
             {
-                LogUnsuccessfulResponse(_logger, method, uri, status, elapsed);
+                var level = GetUnsuccessfulResponseLevel(status);
+                if (level != LogLevel.None)
+                {
+                    LogUnsuccessfulResponse(_logger, level, method, uri, status, elapsed);
+                }
             }
 
             if (_options.LogResponseBody && _logger.IsEnabled(LogLevel.Debug))
@@ -206,14 +224,30 @@ public sealed partial class SanitizingLoggingHandler : DelegatingHandler
     [LoggerMessage(EventId = 1002, Level = LogLevel.Debug, Message = "HTTP 回應 {Method} {Uri} -> {StatusCode},耗時 {ElapsedMilliseconds} ms")]
     private static partial void LogResponse(ILogger logger, string method, string uri, int statusCode, long elapsedMilliseconds);
 
-    [LoggerMessage(EventId = 1003, Level = LogLevel.Warning, Message = "HTTP 回應非成功 {Method} {Uri} -> {StatusCode},耗時 {ElapsedMilliseconds} ms")]
-    private static partial void LogUnsuccessfulResponse(ILogger logger, string method, string uri, int statusCode, long elapsedMilliseconds);
+    // 等級由設定決定(見 RequestLoggingOptions.UnsuccessfulResponseLevel),事件編號與訊息格式不變。
+    // The level comes from the options (see RequestLoggingOptions.UnsuccessfulResponseLevel); the event id and
+    // message format are unchanged.
+    [LoggerMessage(EventId = 1003, Message = "HTTP 回應非成功 {Method} {Uri} -> {StatusCode},耗時 {ElapsedMilliseconds} ms")]
+    private static partial void LogUnsuccessfulResponse(ILogger logger, LogLevel level, string method, string uri, int statusCode, long elapsedMilliseconds);
 
     [LoggerMessage(EventId = 1004, Level = LogLevel.Debug, Message = "HTTP 回應內容 {Method} {Uri}:{Body}")]
     private static partial void LogResponseBody(ILogger logger, string method, string uri, string body);
 
     [LoggerMessage(EventId = 1005, Level = LogLevel.Error, Message = "HTTP 請求失敗 {Method} {Uri},耗時 {ElapsedMilliseconds} ms")]
     private static partial void LogRequestFailed(ILogger logger, string method, string uri, long elapsedMilliseconds, Exception exception);
+
+    /// <summary>
+    /// 決定一個非成功狀態碼的記錄等級:5xx(開啟時)與名單內的狀態碼升級,其餘用一般等級。
+    /// Picks the level for an unsuccessful status code: 5xx (when enabled) and listed codes are elevated, the rest
+    /// use the general level.
+    /// </summary>
+    private LogLevel GetUnsuccessfulResponseLevel(int statusCode)
+    {
+        var isServerError = statusCode is >= 500 and <= 599;
+        return (_elevateServerErrors && isServerError) || _elevatedStatusCodes.Contains(statusCode)
+            ? _elevatedResponseLevel
+            : _unsuccessfulResponseLevel;
+    }
 
     private async Task<string> ReadMaskedBodyAsync(HttpContent content, CancellationToken cancellationToken)
     {
